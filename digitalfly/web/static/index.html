@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>数字果蝇 · Digital Fly</title>
+<style>
+  :root{
+    color-scheme: dark;
+    --page:#0d0d0d; --surface:#1a1a19; --ink:#fff; --ink-2:#c3c2b7;
+    --ink-muted:#898781; --grid:#2c2c2a; --axis:#383835;
+    --border:rgba(255,255,255,0.10);
+    /* 分类色槽（暗色版，已过 CVD / 对比度校验） */
+    --s1:#3987e5; --s2:#d95926; --s3:#199e70;
+    --good:#0ca30c; --warning:#fab219; --critical:#d03b3b;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--page);color:var(--ink);
+       font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+       font-size:14px;line-height:1.5}
+  header{padding:14px 22px;border-bottom:1px solid var(--border);
+         display:flex;align-items:baseline;gap:16px;flex-wrap:wrap}
+  header h1{font-size:17px;margin:0;font-weight:600}
+  header .sub{color:var(--ink-muted);font-size:12.5px}
+  .layout{display:grid;grid-template-columns:320px 1fr;gap:14px;padding:14px}
+  @media(max-width:1000px){.layout{grid-template-columns:1fr}}
+  .card{background:var(--surface);border:1px solid var(--border);
+        border-radius:10px;padding:14px;margin-bottom:14px}
+  .card h2{font-size:12px;font-weight:600;margin:0 0 10px;color:var(--ink-2);
+           letter-spacing:.4px;text-transform:uppercase}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media(max-width:1280px){.grid2{grid-template-columns:1fr}}
+  canvas{display:block;width:100%;border-radius:6px}
+  .tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;
+         margin-bottom:14px}
+  @media(max-width:820px){.tiles{grid-template-columns:repeat(2,1fr)}}
+  .tile{background:var(--surface);border:1px solid var(--border);
+        border-radius:10px;padding:11px 13px}
+  .tile .label{font-size:11.5px;color:var(--ink-muted)}
+  .tile .value{font-size:23px;font-weight:600;margin-top:2px}
+  .tile .unit{font-size:12px;color:var(--ink-muted);font-weight:400;
+              margin-left:3px}
+  .state{font-size:11px;margin-top:3px;color:var(--ink-muted)}
+  .state.ok{color:var(--good)} .state.warn{color:var(--warning)}
+  .row{display:flex;align-items:center;gap:8px;margin-bottom:7px}
+  .row label{flex:1;font-size:12.5px;color:var(--ink-2);white-space:nowrap;
+             overflow:hidden;text-overflow:ellipsis}
+  .row .n{font-size:11px;color:var(--ink-muted);
+          font-variant-numeric:tabular-nums;min-width:44px;text-align:right}
+  input[type=range]{width:100px;accent-color:var(--s1)}
+  button{background:transparent;color:var(--ink-2);
+         border:1px solid var(--border);border-radius:6px;padding:5px 11px;
+         font-size:12.5px;cursor:pointer;font-family:inherit}
+  button:hover{background:rgba(255,255,255,.06);color:var(--ink)}
+  button.on{border-color:var(--s1);color:var(--s1);
+            background:rgba(57,135,229,.10)}
+  button.danger:hover{border-color:#e66767;color:#e66767}
+  .btns{display:flex;gap:8px;flex-wrap:wrap}
+  .btns.mt{margin-top:12px}
+  #video{width:100%;border-radius:6px;background:#000;display:block;
+         object-fit:contain}
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  td{padding:3px 0;color:var(--ink-2)}
+  td.v{text-align:right;font-variant-numeric:tabular-nums;color:var(--ink)}
+  .note{font-size:11.5px;color:var(--ink-muted);margin-top:10px;
+        line-height:1.55}
+  .swatch{display:inline-block;width:9px;height:9px;border-radius:2px;
+          margin-right:6px}
+  .pad{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;
+       max-width:190px;margin:8px auto 0}
+  .pad button{padding:9px 0;font-size:15px}
+  .pad .sp{visibility:hidden}
+  .err{color:var(--critical);font-size:12px;margin-top:8px}
+</style>
+</head>
+<body>
+<header>
+  <h1>数字果蝇 · Digital Fly</h1>
+  <span class="sub" id="hdr">正在连接仿真…</span>
+</header>
+
+<div class="layout">
+  <!-- 左栏：控制 -->
+  <div>
+    <div class="card">
+      <h2>行为</h2>
+      <div class="btns" id="behaviors"></div>
+      <div class="btns mt">
+        <button id="btnRun" class="on">暂停</button>
+        <button id="btnReset">重置</button>
+      </div>
+      <p class="note" id="behaviorNote"></p>
+    </div>
+
+    <div class="card" id="foodCard" style="display:none">
+      <h2>糖源</h2>
+      <div class="row"><label>X</label>
+        <span class="n" id="foodXv">2.2</span>
+        <input type="range" id="foodX" min="-4" max="4" step="0.2" value="2.2"></div>
+      <div class="row"><label>Y</label>
+        <span class="n" id="foodYv">1.2</span>
+        <input type="range" id="foodY" min="-4" max="4" step="0.2" value="1.2"></div>
+      <div class="btns"><button id="btnOdor" class="on">气味开</button></div>
+      <p class="note">果蝇朝糖源走过去，够到后味觉输入经全脑网络传到伸喙运动
+        神经元 MN9，MN9 发放驱动口器 —— 伸喙这一步是连接组算出来的。</p>
+    </div>
+
+    <div class="card" id="cubeCard" style="display:none">
+      <h2>魔方</h2>
+      <table id="cubeInfo"></table>
+      <div class="btns mt">
+        <button id="btnNewCube">换一局</button>
+        <span class="n" id="cubeScrambleV" style="align-self:center">8 步</span>
+        <input type="range" id="cubeScramble" min="4" max="9" step="1" value="8">
+      </div>
+      <p class="note"><b>连接组决定「什么时候拧」</b>：下行神经元活动积累到阈值
+        就触发一次转动，网络越活跃拧得越快。<b>求解器决定「拧哪一面」</b>：
+        解法由本项目自带的 IDA* 搜索得到（最优解）。<br>
+        「果蝇选面」那一行是免费测的：把下行神经元分 6 个子群，取发放最多的
+        当作果蝇自己想拧的面，看它和求解器的一致率 —— 随机猜是 17%。<br>
+        打乱步数越多搜索越慢（9 步约 1 秒，10 步约 40 秒）。</p>
+    </div>
+
+    <div class="card">
+      <h2>手动接管</h2>
+      <div class="row"><label>速度</label>
+        <span class="n" id="mSpeedV">脑</span>
+        <input type="range" id="mSpeed" min="-1" max="1" step="0.05" value="-1"></div>
+      <div class="row"><label>转向</label>
+        <span class="n" id="mTurnV">脑</span>
+        <input type="range" id="mTurn" min="-0.6" max="0.6" step="0.05" value="0"></div>
+      <div class="pad">
+        <span class="sp"></span><button data-turn="0">↑</button><span class="sp"></span>
+        <button data-turn="0.4">↰</button><button id="btnAuto">交给大脑</button>
+        <button data-turn="-0.4">↱</button>
+      </div>
+      <p class="note">滑块拉到最左 = 交还给大脑。转向 &gt; 0 是左转。
+        飞行时转向控制的是左右翅振幅差。</p>
+    </div>
+
+    <div class="card">
+      <h2>刺激注入</h2>
+      <div id="stims"></div>
+      <p class="note">按目标发放率注入（Hz）。感觉输入用发放率编码而不是持续
+        电流 —— LIF 没有适应机制，持续电流会让神经元饱和在约 400 Hz。</p>
+    </div>
+
+    <div class="card">
+      <h2>神经元切除</h2>
+      <div class="btns" id="ablate"></div>
+      <p class="note">切除后该群体永久静默，可以看某条通路对下游的实际贡献。
+        恢复请点重置。</p>
+    </div>
+
+    <div class="card">
+      <h2>数据来源</h2>
+      <table id="info"></table>
+      <p class="note">连接组 MaleCNS v1.0（HHMI Janelia / Cambridge /
+        Google Research, CC-BY 4.0）· 身体 flybody（Google DeepMind ×
+        HHMI Janelia）· 步态运动学 NeuroMechFly v2 / flygym（NeLy-EPFL）。</p>
+    </div>
+  </div>
+
+  <!-- 右栏：可视化 -->
+  <div>
+    <div class="tiles">
+      <div class="tile"><div class="label">全脑平均发放率</div>
+        <div class="value"><span id="tRate">–</span><span class="unit">Hz</span></div>
+        <div class="state" id="tRateState">–</div></div>
+      <div class="tile"><div class="label">MN9 伸喙运动神经元</div>
+        <div class="value"><span id="tMn9">–</span><span class="unit">Hz</span></div>
+        <div class="state" id="tMn9State">–</div></div>
+      <div class="tile"><div class="label">下行神经元 DN</div>
+        <div class="value"><span id="tDn">–</span><span class="unit">Hz</span></div>
+        <div class="state" id="tDnState">–</div></div>
+      <div class="tile"><div class="label">生物时间</div>
+        <div class="value"><span id="tTime">–</span><span class="unit">s</span></div>
+        <div class="state" id="tSpeed">–</div></div>
+    </div>
+
+    <div class="grid2">
+      <div class="card">
+        <h2>身体 · MuJoCo 物理仿真</h2>
+        <img id="video" alt="果蝇身体实时渲染">
+        <div class="btns mt" id="cameras"></div>
+      <div class="btns mt"><button id="btnSplit" class="on">分屏：脑活动</button></div>
+        <p class="note" id="bodyNote"></p>
+        <p class="err" id="err"></p>
+      </div>
+
+      <div class="card">
+        <h2>脑区平均发放率</h2>
+        <canvas id="regions" height="206"></canvas>
+        <p class="note">按解剖学大区聚合。蓝色深浅编码发放率高低（单色顺序色阶）。</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>发放率时间序列</h2>
+      <canvas id="series" height="210"></canvas>
+      <p class="note">三条序列量级相差可达百倍，所以拆成小倍数：每行一把尺子，
+        量程标在行尾，时间轴共享。不用双 y 轴 —— 那是最容易读错的画法。</p>
+    </div>
+
+    <div class="card">
+      <h2>脉冲栅格图 · 全脑随机抽样神经元</h2>
+      <canvas id="raster" height="180"></canvas>
+      <p class="note">纵轴是随机抽取的神经元，横轴是时间，亮度表示该时窗的发放强度。</p>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const css = n => getComputedStyle(document.documentElement)
+                   .getPropertyValue(n).trim();
+const BLUE = ['#cde2fb','#b7d3f6','#9ec5f4','#86b6ef','#6da7ec','#5598e7',
+              '#3987e5','#2a78d6','#256abf','#1c5cab','#184f95','#104281'];
+const ramp = t => BLUE[Math.max(0, Math.min(11, Math.round(t*11)))];
+
+async function post(body){
+  const r = await fetch('/api/control', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  return r.json();
+}
+
+function fitDPR(cv){
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = parseInt(cv.getAttribute('height'));
+  if (cv.width !== w*dpr || cv.height !== h*dpr){
+    cv.width = w*dpr; cv.height = h*dpr; cv.style.height = h+'px';
+  }
+  const g = cv.getContext('2d'); g.setTransform(dpr,0,0,dpr,0,0);
+  return {g, w, h};
+}
+
+/* ---------- 脑区条形图：量级 -> 单色阶 ---------- */
+let regionOrder = [];
+function drawRegions(rates){
+  const cv = $('#regions'); const {g,w,h} = fitDPR(cv);
+  g.clearRect(0,0,w,h);
+  const names = regionOrder.length ? regionOrder : Object.keys(rates);
+  const vals = names.map(n => rates[n] ?? 0);
+  const max = Math.max(...vals, 1e-6);
+  const padL = 118, padR = 46, top = 6;
+  const gap = (h-top)/names.length, bh = Math.min(20, gap-6);
+  g.font = '12px system-ui, sans-serif';
+  names.forEach((n,i) => {
+    const y = top + i*gap, v = vals[i];
+    const bw = Math.max(2, (v/max)*(w-padL-padR));
+    g.fillStyle = css('--ink-2'); g.textAlign = 'right';
+    g.fillText(n.length>14 ? n.slice(0,14) : n, padL-10, y+bh*0.78);
+    g.fillStyle = ramp(v/max);
+    g.beginPath(); g.roundRect(padL, y, bw, bh, [0,4,4,0]); g.fill();
+    g.fillStyle = css('--ink'); g.textAlign = 'left';
+    g.fillText(v.toFixed(1), padL+bw+8, y+bh*0.78);
+  });
+  g.strokeStyle = css('--axis'); g.lineWidth = 1;
+  g.beginPath(); g.moveTo(padL-.5, top); g.lineTo(padL-.5, h-2); g.stroke();
+}
+
+/* ---------- 时间序列：小倍数（三行共享时间轴）----------
+   全脑 3 Hz、MN9 200 Hz 差两个数量级，挤在一根轴上会让其中两条彻底读不出来。
+   规避办法不是加第二根 y 轴（那是最容易误导人的做法），而是拆成小倍数。 */
+const HIST = 240;
+const hist = {brain:[], mn9:[], dn:[]};
+const SERIES = [
+  {k:'brain', c:'--s1', label:'全脑'},
+  {k:'mn9',   c:'--s2', label:'MN9 伸喙'},
+  {k:'dn',    c:'--s3', label:'下行神经元'},
+];
+function drawSeries(){
+  const cv = $('#series'); const {g,w,h} = fitDPR(cv);
+  g.clearRect(0,0,w,h);
+  const padL = 92, padR = 46, padB = 18, gap = 8;
+  const rowH = (h-padB-gap*(SERIES.length-1))/SERIES.length;
+  g.font = '11px system-ui, sans-serif';
+  SERIES.forEach((s,r) => {
+    const top = r*(rowH+gap), d = hist[s.k];
+    const max = Math.max(...d, 1), color = css(s.c);
+    g.fillStyle = css('--ink-2'); g.textAlign = 'right';
+    g.fillText(s.label, padL-26, top+rowH/2+1);
+    g.fillStyle = color;
+    g.beginPath(); g.roundRect(padL-20, top+rowH/2-4, 9, 9, 2); g.fill();
+    g.strokeStyle = css('--grid'); g.lineWidth = 1;
+    g.beginPath(); g.moveTo(padL, top+rowH-.5); g.lineTo(w-padR, top+rowH-.5);
+    g.stroke();
+    g.fillStyle = css('--ink-muted'); g.textAlign = 'left';
+    g.fillText(max.toFixed(max<10?1:0)+' Hz', w-padR+6, top+9);
+    g.fillText('0', w-padR+6, top+rowH);
+    if (d.length > 1){
+      g.strokeStyle = color; g.lineWidth = 2;
+      g.lineJoin = 'round'; g.lineCap = 'round';
+      g.beginPath();
+      d.forEach((v,i) => {
+        const x = padL + (w-padL-padR)*i/(HIST-1);
+        const y = top + rowH - (rowH-6)*(v/max);
+        i ? g.lineTo(x,y) : g.moveTo(x,y);
+      });
+      g.stroke();
+    }
+  });
+  g.fillStyle = css('--ink-muted'); g.textAlign = 'center';
+  g.fillText('← 最近 '+HIST+' 个采样点（约 12 秒生物时间）→',
+             (padL+w-padR)/2, h-4);
+}
+
+/* ---------- 栅格图：滚动位图 ---------- */
+let rimg = null, rx = 0;
+function drawRaster(col){
+  const cv = $('#raster'); const {g,w,h} = fitDPR(cv);
+  const W = Math.floor(w), H = Math.floor(h);
+  if (!rimg || rimg.width !== W || rimg.height !== H){
+    rimg = g.createImageData(W,H); rx = 0;
+    const d = rimg.data;
+    for (let i=0;i<d.length;i+=4){ d[i]=0x1a; d[i+1]=0x1a; d[i+2]=0x19; d[i+3]=255; }
+  }
+  const n = col.length, d = rimg.data, x = rx % W;
+  const maxv = Math.max(...col, 1e-6);
+  for (let y=0;y<H;y++){
+    const v = col[Math.min(n-1, Math.floor(y/H*n))]/maxv;
+    const hex = ramp(v);
+    const t = v < 0.02 ? 0 : 1;
+    const i = (y*W+x)*4;
+    d[i]   = 0x1a + (parseInt(hex.slice(1,3),16)-0x1a)*t;
+    d[i+1] = 0x1a + (parseInt(hex.slice(3,5),16)-0x1a)*t;
+    d[i+2] = 0x19 + (parseInt(hex.slice(5,7),16)-0x19)*t;
+    d[i+3] = 255;
+  }
+  const px = (rx+1)%W;
+  for (let y=0;y<H;y++){
+    const i = (y*W+px)*4; d[i]=0x89; d[i+1]=0x87; d[i+2]=0x81; d[i+3]=255;
+  }
+  rx++; g.putImageData(rimg, 0, 0);
+}
+
+/* ---------- 初始化 ---------- */
+const NOTES = {
+  walk:'脑决定速度与转向，模式发生器产生三角步态。步态运动学来自真实果蝇录像。',
+  forage:'速度与伸喙由连接组决定；转向用显式双侧比较趋化 —— 连接组读不出气味' +
+         '在左还是在右（cli.py sim --exp steering 有定量结论）。',
+  flight:'拴系飞行：躯干固定，翅膀以 218 Hz 真实运动学拍动，转向读数取左右' +
+         '翅振幅差。自由飞行的姿态稳定需要学出来的控制器，此处未做。',
+  cube:'复刻网上那批病毒视频。连接组决定转动的节奏，解法来自 IDA* 求解器 —— ' +
+       '界线标在界面上，不含糊。',
+};
+let curBehavior = 'walk';
+
+fetch('/api/info').then(r=>r.json()).then(info=>{
+  $('#hdr').textContent =
+    `${info.n_neurons.toLocaleString()} 神经元 · ` +
+    `${info.n_edges.toLocaleString()} 条带符号突触边 · 引擎 ${info.backend}`;
+  regionOrder = Object.keys(info.regions);
+  curBehavior = info.behavior;
+
+  const bwrap = $('#behaviors');
+  for (const [k,label] of Object.entries(info.behaviors)){
+    const b = document.createElement('button');
+    b.textContent = label; b.dataset.k = k;
+    if (k === info.behavior) b.className = 'on';
+    b.onclick = async () => {
+      bwrap.querySelectorAll('button').forEach(x=>x.className='');
+      b.className = 'on'; curBehavior = k;
+      $('#behaviorNote').textContent = NOTES[k];
+      $('#foodCard').style.display = (k==='forage') ? '' : 'none';
+      $('#cubeCard').style.display = (k==='cube') ? '' : 'none';
+      hist.brain.length = hist.mn9.length = hist.dn.length = 0; rimg = null;
+      await post({action:'behavior', value:k});
+      fetch('/api/info').then(r=>r.json()).then(renderCameras);
+    };
+    bwrap.appendChild(b);
+  }
+  $('#behaviorNote').textContent = NOTES[info.behavior];
+  $('#foodCard').style.display = (info.behavior==='forage') ? '' : 'none';
+  $('#cubeCard').style.display = (info.behavior==='cube') ? '' : 'none';
+
+  const stims = $('#stims'), abl = $('#ablate');
+  for (const [name,n] of Object.entries(info.groups)){
+    const row = document.createElement('div'); row.className = 'row';
+    row.innerHTML = `<label title="${name}（${n} 个）">${name}</label>` +
+      `<span class="n">0 Hz</span>` +
+      `<input type="range" min="0" max="400" step="10" value="0">`;
+    const sl = row.querySelector('input'), lab = row.querySelector('.n');
+    sl.oninput = () => { lab.textContent = sl.value+' Hz';
+                         post({action:'stim', group:name, rate:+sl.value}); };
+    stims.appendChild(row);
+
+    const b = document.createElement('button');
+    b.textContent = name; b.className = 'danger';
+    b.style.cssText = 'margin:0 6px 6px 0;font-size:11.5px';
+    b.onclick = async () => {
+      const r = await post({action:'ablate', group:name});
+      b.textContent = `${name} ✓${r.ablated}`; b.disabled = true;
+    };
+    abl.appendChild(b);
+  }
+
+  $('#info').innerHTML = `
+    <tr><td>数据集</td><td class="v">${info.dataset}</td></tr>
+    <tr><td>神经元</td><td class="v">${info.n_neurons.toLocaleString()}</td></tr>
+    <tr><td>突触边</td><td class="v">${info.n_edges.toLocaleString()}</td></tr>
+    <tr><td>兴奋性</td><td class="v">${info.excitatory.toLocaleString()}</td></tr>
+    <tr><td>抑制性</td><td class="v">${info.inhibitory.toLocaleString()}</td></tr>`;
+  $('#bodyNote').textContent = info.bridge.replace(/\n\s*/g,' ');
+  // ?snapshot=1 时用单帧而不是 MJPEG 长连接 —— 无头浏览器截图时
+  // 长连接会让页面永远"加载中"，截不出图。
+  const snap = new URLSearchParams(location.search).has('snapshot');
+  $('#video').src = snap ? '/frame?t=' + Date.now() : '/video';
+  renderCameras(info);
+});
+
+function renderCameras(info){
+  const wrap = $('#cameras'); wrap.innerHTML = '';
+  (info.cameras||[]).forEach(c => {
+    const b = document.createElement('button');
+    b.textContent = c; if (c === info.camera) b.className = 'on';
+    b.onclick = () => { wrap.querySelectorAll('button').forEach(x=>x.className='');
+                        b.className='on'; post({action:'camera', value:c}); };
+    wrap.appendChild(b);
+  });
+  $('#bodyNote').textContent = (info.bridge||'').replace(/\n\s*/g,' ');
+}
+
+/* ---------- 控制绑定 ---------- */
+let running = true;
+$('#btnRun').onclick = () => {
+  running = !running;
+  $('#btnRun').textContent = running ? '暂停' : '继续';
+  $('#btnRun').className = running ? 'on' : '';
+  post({action:'toggle', running});
+};
+$('#btnReset').onclick = () => {
+  post({action:'reset'});
+  hist.brain.length = hist.mn9.length = hist.dn.length = 0; rimg = null;
+  document.querySelectorAll('#stims input').forEach(s=>{
+    s.value = 0; s.parentElement.querySelector('.n').textContent = '0 Hz'; });
+};
+
+function sendManual(){
+  const sp = +$('#mSpeed').value, tn = +$('#mTurn').value;
+  const speed = sp < -0.95 ? null : Math.max(0, sp);
+  $('#mSpeedV').textContent = speed === null ? '脑' : speed.toFixed(2);
+  $('#mTurnV').textContent = tn.toFixed(2);
+  post({action:'manual', speed, turn:tn});
+}
+$('#mSpeed').oninput = sendManual;
+$('#mTurn').oninput = sendManual;
+$('#btnAuto').onclick = () => {
+  $('#mSpeed').value = -1; $('#mTurn').value = 0;
+  $('#mSpeedV').textContent = '脑'; $('#mTurnV').textContent = '脑';
+  post({action:'manual', speed:null, turn:null});
+};
+document.querySelectorAll('.pad button[data-turn]').forEach(b => {
+  b.onclick = () => { $('#mTurn').value = b.dataset.turn;
+                      if (+$('#mSpeed').value < -0.95) $('#mSpeed').value = 0.8;
+                      sendManual(); };
+});
+
+function sendFood(){
+  const x = +$('#foodX').value, y = +$('#foodY').value;
+  $('#foodXv').textContent = x.toFixed(1);
+  $('#foodYv').textContent = y.toFixed(1);
+  post({action:'food', x, y});
+}
+$('#foodX').oninput = sendFood; $('#foodY').oninput = sendFood;
+$('#cubeScramble').oninput = () => {
+  $('#cubeScrambleV').textContent = $('#cubeScramble').value + ' 步'; };
+$('#btnNewCube').onclick = () => {
+  $('#btnNewCube').textContent = '求解中…'; $('#btnNewCube').disabled = true;
+  post({action:'new_cube', scramble:+$('#cubeScramble').value})
+    .finally(() => { $('#btnNewCube').textContent = '换一局';
+                     $('#btnNewCube').disabled = false; });
+};
+let splitOn = true;
+$('#btnSplit').onclick = () => {
+  splitOn = !splitOn;
+  $('#btnSplit').textContent = splitOn ? '分屏：脑活动' : '分屏：关';
+  $('#btnSplit').className = splitOn ? 'on' : '';
+  post({action:'split', on:splitOn});
+};
+let odorOn = true;
+$('#btnOdor').onclick = () => {
+  odorOn = !odorOn;
+  $('#btnOdor').textContent = odorOn ? '气味开' : '气味关';
+  $('#btnOdor').className = odorOn ? 'on' : '';
+  post({action:'odor', on:odorOn});
+};
+
+/* ---------- 数据流 ---------- */
+const es = new EventSource('/stream');
+es.onmessage = ev => {
+  const d = JSON.parse(ev.data);
+  $('#tRate').textContent = d.mean_rate_hz.toFixed(2);
+  $('#tMn9').textContent  = d.mn9_hz.toFixed(0);
+  $('#tDn').textContent   = d.dn_hz.toFixed(0);
+  $('#tTime').textContent = (d.t_ms/1000).toFixed(1);
+  $('#tSpeed').textContent = '仿真速度 ' + (d.speed_ratio||0).toFixed(2) + '× 实时';
+
+  // 真实果蝇脑的平均发放率是个位数赫兹。超过 5 Hz 说明刺激过强，
+  // 网络进入了自持放电状态，此时的结果不能当生理数据看。
+  const st = $('#tRateState');
+  if (d.mean_rate_hz > 5){ st.className='state warn'; st.textContent='⚠ 过度兴奋 — 刺激过强'; }
+  else if (d.mean_rate_hz > 0){ st.className='state ok'; st.textContent='✓ 生理区间'; }
+  else { st.className='state'; st.textContent='· 静默'; }
+
+  $('#tMn9State').textContent = d.proboscis !== undefined
+    ? `伸喙 ${(d.proboscis*100).toFixed(0)}%`
+    : (d.mn9_hz > 0 ? '发放中' : '· 静默');
+  $('#tDnState').textContent =
+    `速度 ${(d.speed ?? 0).toFixed(2)} · 转向 ${(d.turn ?? 0).toFixed(2)}` +
+    (d.manual_speed !== null && d.manual_speed !== undefined ? ' · 手动' : '');
+  $('#err').textContent = d.error || '';
+
+  if (d.cube_total !== undefined){
+    const pct = d.cube_charge !== undefined ? Math.round(d.cube_charge*100) : 0;
+    $('#cubeInfo').innerHTML = `
+      <tr><td>进度</td><td class="v">${d.cube_move} / ${d.cube_total} 步</td></tr>
+      <tr><td>下一步</td><td class="v">${d.cube_next}</td></tr>
+      <tr><td>蓄力（下行活动）</td><td class="v">${pct}%</td></tr>
+      <tr><td>果蝇想拧</td><td class="v">${d.cube_proposed}</td></tr>
+      <tr><td>果蝇选面一致率</td><td class="v">${
+        d.cube_agree === null || d.cube_agree === undefined
+          ? '—' : d.cube_agree + '%（随机 17%）'}</td></tr>
+      <tr><td>解法来源</td><td class="v">${d.cube_source}</td></tr>
+      <tr><td>状态</td><td class="v">${d.cube_solved ? '已复原 ✓' : '未复原'}</td></tr>`;
+  }
+  if (d.dist !== undefined){
+    $('#behaviorNote').textContent =
+      `距糖源 ${d.dist}　气味 左${d.odor[0]} / 右${d.odor[1]}` +
+      (d.reached ? '　已够到' : '') + '　— ' + NOTES.forage;
+  }
+
+  for (const [k,v] of Object.entries(
+        {brain:d.mean_rate_hz, mn9:d.mn9_hz, dn:d.dn_hz})){
+    hist[k].push(v); if (hist[k].length > HIST) hist[k].shift();
+  }
+  drawRegions(d.regions); drawSeries(); drawRaster(d.raster);
+};
+window.addEventListener('resize', () => { rimg = null; drawSeries(); });
+</script>
+</body>
+</html>

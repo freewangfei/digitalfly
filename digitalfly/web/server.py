@@ -1,0 +1,560 @@
+"""数字果蝇的交互式 Web 控制台。
+
+后台一条仿真线程持续跑 感觉 -> 全脑网络 -> 指令 -> 运动模式发生器 -> 物理，
+前端通过两条流拿数据：
+    /video   MuJoCo 离屏渲染的 MJPEG 流（3D 画面）
+    /stream  SSE 数值流（全脑活动、脑区发放率、行为状态）
+两条流互相独立，视频卡住不会阻塞数值面板。
+
+可以在线切换行为（行走 / 觅食 / 拴系飞行）、注入刺激、切除神经元、
+接管速度与转向、移动糖源、切换机位。
+"""
+from __future__ import annotations
+
+import io
+import json
+import threading
+import time
+from pathlib import Path
+
+import numpy as np
+from flask import Flask, Response, jsonify, request, send_from_directory
+
+STATIC = Path(__file__).parent / "static"
+
+# 可注入刺激的神经元群：显示名 -> NeuronIndex 上的方法名
+STIM_GROUPS = {
+    "糖味通路 Sugar SEL": "sugar_pathway",
+    "苦味通路 Bitter SEL": "bitter_pathway",
+    "唇瓣味觉 GRN": "labellar_grns",
+    "食物气味通道 ORN": "food_odor_orns",
+    "嗅觉（全部）": "olfactory",
+    "视觉 Photoreceptors": "photoreceptors",
+    "本体感觉": "proprioceptive",
+    "机械感觉": "mechanosensory",
+    "下行神经元 DN": "descending",
+}
+
+BEHAVIOR_LABELS = {"walk": "行走", "forage": "觅食", "flight": "拴系飞行",
+                   "cube": "拧魔方"}
+CTRL_EVERY = 20          # 每 20 个脑步（10 ms）更新一次运动指令
+
+
+class Simulation:
+    """后台仿真线程。持有大脑，以及当前行为对应的身体与模式发生器。"""
+
+    def __init__(self, backend: str | None = None, behavior: str = "walk",
+                 raster_size: int = 120):
+        from ..brain import Brain
+        from ..bridge import CommandBridge
+        from ..calibrate import calibrated_params
+        from ..connectome import load
+        from ..neurons import NeuronIndex
+
+        self.c = load()
+        self.idx = NeuronIndex(self.c)
+        self.brain = Brain(self.c.W, calibrated_params(), backend=backend)
+        self.bridge = CommandBridge(self.c, dt_ms=self.brain.p.dt)
+        self.regions = self.idx.by_region()
+        self.mn9 = self.idx.proboscis_motor()
+
+        # 全脑三维点云：神经元发放时闪烁，和任务画面拼成分屏
+        from ..brainview import BrainView
+        self.view = BrainView(self.c.meta, self.regions, size=(360, 420))
+        self.split = True
+
+        rng = np.random.default_rng(0)
+        self.raster_idx = rng.choice(self.brain.n, size=raster_size,
+                                     replace=False)
+
+        self.lock = threading.RLock()
+        self.running = True
+        self.stim: dict[str, float] = {}
+        self.ablated: set[str] = set()
+        self.frame: bytes | None = None
+        self.latest: dict = {}
+        self.error: str | None = None
+        self._stop = threading.Event()
+        self._ext = np.zeros(self.brain.n, dtype=np.float32)
+        self._group_cache: dict[str, np.ndarray] = {}
+
+        # 手动接管：None 表示交给大脑
+        self.manual_speed: float | None = None
+        self.manual_turn: float | None = None
+        self.food_xy = [2.2, 1.2]
+        self.odor_on = True
+        self.camera = "track1"
+
+        self.body = None
+        self.behavior = None
+        self.set_behavior(behavior)
+
+    # -- 行为切换 -----------------------------------------------------------
+    def set_behavior(self, name: str) -> None:
+        """切换行为。不同行为的身体配置不同，要重建身体。"""
+        from ..body import FlyBody
+        from ..locomotion import PreprogrammedGait, WingBeat
+
+        if name not in BEHAVIOR_LABELS:
+            raise ValueError(f"未知行为 {name}")
+        with self.lock:
+            if self.body is not None:
+                self.body.close()
+            self.behavior = name
+            self.scene = None
+            if name == "cube":
+                from ..cube_scene import CubeScene
+                self.scene = CubeScene(size=0.55, pos=(0.55, 0.0, 0.28))
+                self.body = FlyBody(mode="walk", render_size=(360, 480),
+                                    cube_scene=self.scene)
+                self.scene.bind(self.body.model, self.body.data)
+                self._new_cube()
+            else:
+                self.body = FlyBody(mode=name, render_size=(360, 480))
+            self.gait = self.wings = None
+            if name == "flight":
+                self.dt_ctrl = 2e-4
+                self.wings = WingBeat(self.body, dt_ctrl=self.dt_ctrl)
+                for a in self.wings.act:
+                    self.body.model.actuator_gainprm[a][0] = 70.0
+            else:
+                self.gait = PreprogrammedGait(self.body)
+                self.dt_ctrl = self.brain.p.dt / 1000.0 * CTRL_EVERY
+            self.cameras = self.body.camera_names
+            want = {"cube": "cube_cam", "flight": "flight_close"}.get(
+                name, "track1")
+            if name in ("cube", "flight") or self.camera not in self.cameras:
+                self.camera = (want if want in self.cameras
+                               else self.cameras[0])
+            self._fresh()
+
+    def _new_cube(self, scramble: int = 8, seed: int | None = None) -> None:
+        """打乱并求解一局魔方（已持锁）。"""
+        import random
+
+        from ..cube import Cube, solve
+        self.scene.state = Cube()
+        seed = random.randrange(10000) if seed is None else seed
+        self.cube_scramble = self.scene.state.scramble(scramble, seed=seed)
+        sol, src = solve(self.scene.state.copy(), fallback=self.cube_scramble)
+        self.cube_solution = sol
+        self.cube_source = src
+        self.cube_i = 0
+        self.cube_charge = 0.0
+        self.cube_agree = []
+        self.cube_solved_at = None
+        self.scene.write()
+
+    def _fresh(self) -> None:
+        """复位大脑、身体与各层状态（已持锁）。"""
+        self.brain.reset()
+        self.bridge.reset()
+        self.body.reset()
+        if self.gait:
+            self.gait.reset()
+        if self.wings:
+            self.wings.reset()
+        self.tether = np.array(self.body.data.qpos[:7], dtype=np.float64)
+        self.ctrl = self.body.rest.copy()
+        self.h0 = self.body.heading().copy()
+        self.step_i = 0
+        self.reached = False
+        self.cur_turn = 0.0
+        self.cur_speed = 0.0
+        self.proboscis = 0.0
+        self.error = None
+        if self.behavior == "cube":
+            self._new_cube()
+
+    # -- 群体索引 ----------------------------------------------------------
+    def group_indices(self, name: str) -> np.ndarray:
+        if name not in self._group_cache:
+            method = STIM_GROUPS.get(name)
+            self._group_cache[name] = (
+                getattr(self.idx, method)() if method
+                else np.array([], dtype=np.int64))
+        return self._group_cache[name]
+
+    # -- 控制 --------------------------------------------------------------
+    def set_stim(self, name: str, rate_hz: float) -> None:
+        with self.lock:
+            if rate_hz <= 0:
+                self.stim.pop(name, None)
+            else:
+                self.stim[name] = float(rate_hz)
+
+    def ablate(self, name: str) -> int:
+        idx = self.group_indices(name)
+        with self.lock:
+            self.brain.ablate(idx)
+            self.ablated.add(name)
+        return len(idx)
+
+    def reset(self) -> None:
+        with self.lock:
+            self.stim.clear()
+            self.ablated.clear()
+            self._fresh()
+
+    # -- 主循环 ------------------------------------------------------------
+    def loop(self) -> None:
+        from PIL import Image
+
+        dt_brain = self.brain.p.dt / 1000.0
+        push_every = int(round(0.05 / dt_brain))
+        window = np.zeros(self.brain.n, dtype=np.float32)
+        window_steps = 0
+        raster_buf: list[np.ndarray] = []
+        t_wall = time.time()
+        info: dict = {}
+
+        while not self._stop.is_set():
+            if not self.running:
+                time.sleep(0.05)
+                continue
+            try:
+                with self.lock:
+                    spikes, info = self._advance(dt_brain)
+                    i = self.step_i
+                    self.step_i += 1
+            except Exception as e:                        # noqa: BLE001
+                self.error = f"{type(e).__name__}: {e}"
+                self.running = False
+                continue
+
+            window += spikes
+            window_steps += 1
+            raster_buf.append(spikes[self.raster_idx].astype(np.uint8))
+
+            if i % push_every == 0 and window_steps:
+                secs = window_steps * dt_brain
+
+                def rate_of(v):
+                    return float(window[v].sum() / max(len(v), 1) / secs)
+
+                now = time.time()
+                d = self.body.displacement()
+                self.latest = {
+                    "t_ms": round(self.brain.t_ms, 1),
+                    "behavior": self.behavior,
+                    "mean_rate_hz": round(
+                        float(window.sum() / self.brain.n / secs), 2),
+                    "regions": {k: round(rate_of(v), 2)
+                                for k, v in self.regions.items()},
+                    "mn9_hz": round(rate_of(self.mn9), 1),
+                    "dn_hz": round(rate_of(self.bridge.dn_all), 1),
+                    "raster": [round(float(x), 3)
+                               for x in np.mean(raster_buf, axis=0)],
+                    "displacement": [round(float(x), 3) for x in d],
+                    "speed_ratio": round(secs / max(now - t_wall, 1e-9), 2),
+                    "stim": dict(self.stim),
+                    "ablated": sorted(self.ablated),
+                    "running": self.running,
+                    "camera": self.camera,
+                    "manual_speed": self.manual_speed,
+                    "manual_turn": self.manual_turn,
+                    "food": self.food_xy,
+                    "odor_on": self.odor_on,
+                    "error": self.error,
+                    **info,
+                }
+                window[:] = 0.0
+                window_steps = 0
+                raster_buf.clear()
+                t_wall = now
+
+            self.view.update(spikes, dt_brain * 1000)
+
+            if i % push_every == 0:
+                try:
+                    with self.lock:
+                        px = self.body.render(self.camera)
+                    if self.split:
+                        from ..brainview import draw_overlay, side_by_side
+                        d = self.latest or {}
+                        px = side_by_side(px, draw_overlay(
+                            self.view.render(),
+                            "全脑活动 · MaleCNS v1.0",
+                            [f"{self.brain.n:,} 神经元 · 白点 = 此刻发放",
+                             f"全脑 {d.get('mean_rate_hz', 0)} Hz　"
+                             f"下行 {d.get('dn_hz', 0)} Hz"],
+                            self.view.labels))
+                    buf = io.BytesIO()
+                    Image.fromarray(px).save(buf, format="JPEG", quality=75)
+                    self.frame = buf.getvalue()
+                except Exception:                        # noqa: BLE001
+                    pass
+
+    def _advance(self, dt_brain: float) -> tuple[np.ndarray, dict]:
+        """推进一个脑步，返回 (脉冲向量, 行为状态)。"""
+        body, br = self.body, self.bridge
+        info: dict = {}
+
+        # --- 感觉输入 ---------------------------------------------------
+        odor_l = odor_r = taste = 0.0
+        if self.behavior == "forage" and self.odor_on:
+            pos = body.root_pos[:2]
+            h = body.heading()
+            lat = np.array([-h[1], h[0]])
+            food = np.asarray(self.food_xy, dtype=np.float64)
+            sigma = 1.6
+
+            def conc(p):
+                return float(np.exp(-np.sum((food - p) ** 2) /
+                                    (2 * sigma ** 2)))
+
+            odor_l = conc(pos + 0.12 * lat + 0.1 * h)
+            odor_r = conc(pos - 0.12 * lat + 0.1 * h)
+            dist = float(np.linalg.norm(food - pos))
+            taste = 1.0 if dist < 0.3 else 0.0
+            if taste:
+                self.reached = True
+            info["dist"] = round(dist, 2)
+            info["odor"] = [round(odor_l, 2), round(odor_r, 2)]
+            info["reached"] = self.reached
+
+        br.sensory_current(self.brain.n, body=body, odor_left=odor_l,
+                           odor_right=odor_r, taste=taste, out=self._ext)
+        # 行走 / 觅食需要背景驱动，否则网络静默、果蝇不会起步
+        if self.behavior != "flight":
+            br._drive(self._ext, br.proprio, 20.0)
+        for name, rate in self.stim.items():
+            br._drive(self._ext, self.group_indices(name), rate)
+
+        spikes = self.brain.step(self._ext)
+        cmd = br.read_command(spikes)
+        info["cmd_speed"] = round(cmd.speed, 2)
+
+        # --- 运动 -------------------------------------------------------
+        sub = max(1, int(round(dt_brain / body.timestep)))
+        if self.behavior == "flight":
+            turn = (self.manual_turn if self.manual_turn is not None
+                    else float(np.clip(0.6 * cmd.turn, -0.8, 0.8)))
+            self.cur_turn = turn
+            self.wings.step(self.ctrl, freq_rel=0.0, asymmetry=turn,
+                            amplitude=1.0)
+            body.step(self.ctrl, n_substeps=sub)
+            # 拴系：躯干固定，只看翅膀运动学与转向读数
+            body.data.qpos[:7] = self.tether
+            body.data.qvel[:6] = 0.0
+            info["wing_stroke"] = round(
+                float(body.data.qpos[self.wings.qadr[0]]), 2)
+        else:
+            if self.step_i % CTRL_EVERY == 0:
+                if self.manual_turn is not None:
+                    turn = self.manual_turn
+                elif self.behavior == "forage" and self.odor_on:
+                    # 显式双侧比较趋化（不是连接组，见 sim --exp steering）
+                    diff = (odor_l - odor_r) / max(odor_l + odor_r, 1e-6)
+                    turn = float(np.clip(8.0 * diff, -0.5, 0.5))
+                elif self.behavior == "cube":
+                    # 绕着魔方转圈，免得走出画面
+                    from ..behaviors import _orbit
+                    turn = _orbit(body, self.scene.origin[:2], radius=0.55)
+                else:
+                    h = body.heading()
+                    err = float(self.h0[0] * h[1] - self.h0[1] * h[0])
+                    turn = float(np.clip(0.3 * cmd.turn + 1.2 * err,
+                                         -0.5, 0.5))
+                speed = (self.manual_speed if self.manual_speed is not None
+                         else float(np.clip(cmd.speed, 0.35, 1.0)))
+                if taste:
+                    speed = 0.0
+                self.cur_turn, self.cur_speed = turn, speed
+                self.gait.step(self.ctrl, self.dt_ctrl, speed=speed,
+                               turn=turn, adhesion=0.5)
+
+                if self.behavior == "forage":
+                    # 伸喙由 MN9 的发放驱动 —— 这一段是连接组算出来的
+                    inst = float(spikes[self.mn9].mean()) / dt_brain
+                    self.proboscis += 0.25 * (
+                        float(np.clip(inst / 60.0, 0, 1)) - self.proboscis)
+                    for k, n in enumerate(("rostrum", "haustellum",
+                                           "labrum_left", "labrum_right")):
+                        a = body.act_index.get(n)
+                        if a is not None:
+                            lo, hi = body.ctrl_range[a]
+                            self.ctrl[a] = lo + (hi - lo) * (
+                                self.proboscis if k < 2
+                                else 0.5 * self.proboscis)
+                    info["proboscis"] = round(self.proboscis, 2)
+            body.step(self.ctrl, n_substeps=sub)
+            info["fallen"] = body.fallen()
+
+        if self.behavior == "cube":
+            info.update(self._advance_cube(dt_brain, spikes))
+
+        info["turn"] = round(self.cur_turn, 3)
+        info["speed"] = round(self.cur_speed, 2)
+        return spikes, info
+
+    def _advance_cube(self, dt_brain: float, spikes: np.ndarray) -> dict:
+        """魔方：连接组决定「什么时候拧」，求解器决定「拧哪一面」。"""
+        FACES = ("U", "R", "F", "D", "L", "B")
+        dn = self.bridge.dn_all
+        if not hasattr(self, "_cube_win"):
+            self._cube_win = np.zeros(len(dn), dtype=np.float32)
+            self._cube_steps = 0
+        self._cube_win += spikes[dn]
+        self._cube_steps += 1
+
+        if self.step_i % CTRL_EVERY == 0 and self._cube_steps:
+            secs = self._cube_steps * dt_brain
+            dn_hz = float(self._cube_win.sum() / len(dn) / secs)
+            # 下行活动按发放率积累，满一格触发一次转动：
+            # 网络越活跃，果蝇拧得越快
+            self.cube_charge += dn_hz * secs / 1.6
+            if (self.cube_charge >= 1.0 and not self.scene.animating
+                    and self.cube_i < len(self.cube_solution)):
+                self.cube_charge = 0.0
+                mv = self.cube_solution[self.cube_i]
+                groups = [dn[i::6] for i in range(6)]
+                rates = [float(spikes[g].sum()) for g in groups]
+                proposed = FACES[int(np.argmax(rates))]
+                self.cube_agree.append(proposed == mv[0])
+                self.scene.start_move(mv, duration=0.35)
+                self.cube_i += 1
+                self._cube_proposed = proposed
+            self._cube_win[:] = 0.0
+            self._cube_steps = 0
+
+        if self.scene.advance(dt_brain) and self.scene.state.is_solved():
+            self.cube_solved_at = self.brain.t_ms / 1000.0
+        self.scene.write()
+
+        n = len(self.cube_agree)
+        return {
+            "cube_move": self.cube_i,
+            "cube_total": len(self.cube_solution),
+            "cube_source": self.cube_source,
+            "cube_solved": self.cube_solved_at is not None,
+            "cube_charge": round(min(self.cube_charge, 1.0), 2),
+            "cube_next": (self.cube_solution[self.cube_i]
+                          if self.cube_i < len(self.cube_solution) else "—"),
+            "cube_proposed": getattr(self, "_cube_proposed", "—"),
+            "cube_agree": (round(100 * sum(self.cube_agree) / n)
+                           if n else None),
+        }
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+def create_app(backend: str | None = None,
+               behavior: str = "walk") -> tuple[Flask, Simulation]:
+    app = Flask(__name__, static_folder=None)
+    sim = Simulation(backend=backend, behavior=behavior)
+    threading.Thread(target=sim.loop, daemon=True).start()
+
+    @app.route("/")
+    def index():
+        return send_from_directory(STATIC, "index.html")
+
+    @app.route("/api/info")
+    def info():
+        s = sim.c.stats
+        return jsonify({
+            "dataset": s["dataset"],
+            "n_neurons": s["n_neurons"],
+            "n_edges": s["n_edges"],
+            "excitatory": s["excitatory_edges"],
+            "inhibitory": s["inhibitory_edges"],
+            "backend": sim.brain.backend,
+            "behaviors": BEHAVIOR_LABELS,
+            "behavior": sim.behavior,
+            "cameras": sim.cameras,
+            "n_actuators": sim.body.n_act,
+            "bridge": sim.bridge.report.summary(),
+            "groups": {k: int(len(sim.group_indices(k))) for k in STIM_GROUPS},
+            "regions": {k: int(len(v)) for k, v in sim.regions.items()},
+            "raster_size": len(sim.raster_idx),
+        })
+
+    @app.route("/api/control", methods=["POST"])
+    def control():
+        req = request.get_json(force=True)
+        action = req.get("action")
+        try:
+            if action == "stim":
+                sim.set_stim(req["group"], float(req.get("rate", 0)))
+            elif action == "ablate":
+                return jsonify({"ok": True,
+                                "ablated": sim.ablate(req["group"])})
+            elif action == "reset":
+                sim.reset()
+            elif action == "toggle":
+                sim.running = bool(req.get("running", True))
+            elif action == "behavior":
+                sim.set_behavior(req["value"])
+            elif action == "split":
+                sim.split = bool(req.get("on", True))
+            elif action == "camera":
+                sim.camera = req["value"]
+            elif action == "manual":
+                sim.manual_speed = (None if req.get("speed") is None
+                                    else float(req["speed"]))
+                sim.manual_turn = (None if req.get("turn") is None
+                                   else float(req["turn"]))
+            elif action == "food":
+                sim.food_xy = [float(req["x"]), float(req["y"])]
+                sim.reached = False
+            elif action == "new_cube":
+                with sim.lock:
+                    sim._new_cube(int(req.get("scramble", 8)))
+            elif action == "odor":
+                sim.odor_on = bool(req.get("on", True))
+            else:
+                return jsonify({"ok": False,
+                                "error": f"未知动作 {action}"}), 400
+        except Exception as e:                            # noqa: BLE001
+            return jsonify({"ok": False, "error": str(e)}), 400
+        return jsonify({"ok": True})
+
+    @app.route("/stream")
+    def stream():
+        def gen():
+            last = None
+            while True:
+                d = sim.latest
+                if d and d is not last:
+                    last = d
+                    yield f"data: {json.dumps(d, ensure_ascii=False)}\n\n"
+                time.sleep(0.04)
+        return Response(gen(), mimetype="text/event-stream",
+                        headers={"Cache-Control": "no-cache",
+                                 "X-Accel-Buffering": "no"})
+
+    @app.route("/frame")
+    def frame():
+        """单张 JPEG。给截图和不方便处理 MJPEG 长连接的客户端用。"""
+        f = sim.frame
+        if not f:
+            return Response(status=503)
+        return Response(f, mimetype="image/jpeg",
+                        headers={"Cache-Control": "no-store"})
+
+    @app.route("/video")
+    def video():
+        def gen():
+            while True:
+                f = sim.frame
+                if f:
+                    yield (b"--frame\r\nContent-Type: image/jpeg\r\n"
+                           b"Content-Length: " + str(len(f)).encode() +
+                           b"\r\n\r\n" + f + b"\r\n")
+                time.sleep(0.05)
+        return Response(gen(), mimetype="multipart/x-mixed-replace; "
+                                        "boundary=frame")
+
+    return app, sim
+
+
+def main(host: str = "0.0.0.0", port: int = 8080,
+         backend: str | None = None, behavior: str = "walk") -> int:
+    app, sim = create_app(backend, behavior)
+    print(f"\n数字果蝇控制台 -> http://localhost:{port}\n")
+    try:
+        app.run(host=host, port=port, threaded=True, debug=False)
+    finally:
+        sim.stop()
+    return 0

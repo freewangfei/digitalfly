@@ -1,0 +1,11 @@
+data/raw/
+data/build/
+outputs/
+third_party/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 本地仿真产物
+*.mp4
+docs/images/*.tmp
