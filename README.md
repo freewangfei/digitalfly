@@ -198,14 +198,34 @@ Four constraints. Drop any one and it stops learning; each was forced by measure
 
 ### The result, stated plainly
 
-| | Accuracy |
-|---|---|
-| **Linearly decodable** ceiling of medulla activity | **85.8%** (pixel baseline 86.9%, shuffled labels 9.6%) |
-| **In-brain decision**, 4 classes | 14.6% → **52.1%** (chance 25%), one epoch |
+| | Accuracy | Chance |
+|---|---|---|
+| **Linearly decodable** ceiling of medulla activity | **85.8%** (pixel baseline 86.9%, shuffled 9.6%) | 10% |
+| **In-brain decision**, 4 classes (one epoch) | 14.6% → **52.1%** | 25% |
+| **In-brain decision**, 10 classes (14 epochs) | 14.2% → **36.7%**, 45% on train | 10% |
+
+The 10-class 36.7% is not uniform — **some digits are learned, others not at all**
+(12 test images each): 0 scores 10/12, 1 and 4 score 8/12; 2, 5 and 7 score 0/12.
+Zero becomes an attractor and 7 is read as 9 almost every time. That is what a
+capacity-limited decision layer looks like: 665 neurons split ten ways is 66 cells
+and ~1,270 plastic synapses per class.
 
 **The information really is in the brain** — the same medulla activity reads out at
-85.8% linearly, 99% of the pixel baseline. The in-brain plasticity rule extracts far
-less than that. The gap is the price of the biological rule, reported as measured.
+85.8% linearly, 99% of the pixel baseline. The in-brain rule reaches 36.7%. Those 49
+points are the price of using the fly's own synapses and the fly's own learning rule,
+reported as measured.
+
+Going further is limited by decision-layer capacity, not by the rule. The right cells
+are the LCs (624 cells, strongly convergent) — and none of them spike at the
+calibrated operating point. Same one-synapse wall; more epochs do not get around it.
+
+What the three iterations cost:
+
+| Version | 4-class | 10-class | What was wrong |
+|---|---|---|---|
+| Depression-only + Tm1 single-column | 42.5% | — | weights locked in [0, w0], monotone contraction; 0.6 plastic inputs per decision neuron |
+| Bidirectional + wide-field Dm | **52.1%** | 13–23%, oscillating | potentiation ran away, total strength up to 1.378 |
+| Bidirectional + Dm + synaptic scaling | — | **36.7%** | strength pinned at 1.000, rises steadily to plateau |
 
 The web console lets you draw with the mouse, hit recognise, and watch which neurons
 light up during recognition.
