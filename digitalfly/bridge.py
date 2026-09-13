@@ -278,6 +278,21 @@ class CommandBridge:
         if hit.any():
             ext[idx[hit]] += self.SPIKE_KICK
 
+    def _drive_rates(self, ext: np.ndarray, idx: np.ndarray,
+                     rates_hz: np.ndarray) -> None:
+        """按每个神经元各自的目标发放率注入（视觉输入用）。
+
+        和 `_drive` 的区别是这里每个神经元的速率可以不同 —— 一张图像在
+        视网膜上本来就是每个视柱一个亮度。
+        """
+        if not len(idx):
+            return
+        p = np.clip(np.asarray(rates_hz, dtype=np.float64)
+                    * self.dt_ms / 1000.0, 0.0, 1.0)
+        hit = self.rng.random(len(idx)) < p
+        if hit.any():
+            ext[idx[hit]] += self.SPIKE_KICK
+
     def sensory_current(self, n: int, body=None,
                         odor_left: float = 0.0, odor_right: float = 0.0,
                         taste: float = 0.0,

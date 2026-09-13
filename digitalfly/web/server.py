@@ -87,7 +87,19 @@ class Simulation:
 
         self.body = None
         self.behavior = None
+        self.recognizer = None
+        self.recog_error = None
         self.set_behavior(behavior)
+
+    def get_recognizer(self):
+        """懒加载手写识别器（要额外建一份视觉编码器，比较重）。"""
+        if self.recognizer is None and self.recog_error is None:
+            try:
+                from ..handwriting import Recognizer
+                self.recognizer = Recognizer(self.c, verbose=False)
+            except Exception as e:                        # noqa: BLE001
+                self.recog_error = str(e)
+        return self.recognizer
 
     # -- 行为切换 -----------------------------------------------------------
     def set_behavior(self, name: str) -> None:
@@ -440,6 +452,31 @@ class Simulation:
         self._stop.set()
 
 
+def _brain_snapshot(sim, spikes: np.ndarray, out: dict) -> str:
+    """把识别期间的全脑活动渲染成一张图，base64 回给前端。"""
+    import base64
+
+    from PIL import Image
+
+    from ..brainview import draw_overlay
+
+    view = sim.view
+    view.heat[:] = 0.0
+    s = spikes[view.idx]
+    peak = float(s.max()) or 1.0
+    view.heat += np.clip(s / peak, 0, 1) * 1.4
+    img = draw_overlay(
+        view.render(), "识别期间的全脑活动",
+        [f"预测 {out['prediction']}　置信 "
+         f"{out['confidence'] * 100:.0f}%　全脑 {out['brain_hz']:.1f} Hz",
+         "亮度 = 这次识别里该神经元发放了多少"],
+        view.labels)
+    buf = __import__("io").BytesIO()
+    Image.fromarray(img).save(buf, format="JPEG", quality=78)
+    view.heat[:] = 0.0
+    return base64.b64encode(buf.getvalue()).decode()
+
+
 def create_app(backend: str | None = None,
                behavior: str = "walk") -> tuple[Flask, Simulation]:
     app = Flask(__name__, static_folder=None)
@@ -509,6 +546,53 @@ def create_app(backend: str | None = None,
         except Exception as e:                            # noqa: BLE001
             return jsonify({"ok": False, "error": str(e)}), 400
         return jsonify({"ok": True})
+
+    @app.route("/api/recognize", methods=["POST"])
+    def recognize():
+        """收一张手写图（28x28 灰度，0~1 的一维数组），交给果蝇的视觉系统。"""
+        r = sim.get_recognizer()
+        if r is None:
+            return jsonify({"ok": False, "error": sim.recog_error or
+                            "识别器不可用"}), 400
+        try:
+            req = request.get_json(force=True)
+            px = np.asarray(req["pixels"], dtype=np.float32)
+            n = int(round(len(px) ** 0.5))
+            img = px.reshape(n, n)
+            if float(img.max()) <= 0:
+                return jsonify({"ok": False, "error": "画布是空的"}), 400
+            with sim.lock:
+                out = r.recognise(img, keep_spikes=True)
+            spikes = out.pop("_spikes", None)
+            # 把这次识别期间的全脑活动画出来 —— 哪些神经元亮了
+            if spikes is not None:
+                out["brain_png"] = _brain_snapshot(sim, spikes, out)
+            out["ok"] = True
+            out["model"] = r.meta
+            return jsonify(out)
+        except Exception as e:                            # noqa: BLE001
+            return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 400
+
+    @app.route("/api/feedback", methods=["POST"])
+    def feedback():
+        """用户告诉它刚才那张图真正是什么，就地更新读出层。"""
+        r = sim.get_recognizer()
+        if r is None:
+            return jsonify({"ok": False, "error": sim.recog_error}), 400
+        req = request.get_json(force=True)
+        if req.get("action") == "reset":
+            return jsonify(r.reset_online())
+        true_char = str(req.get("true", "")).strip().upper()
+        with sim.lock:
+            return jsonify(r.feedback(true_char))
+
+    @app.route("/api/recognizer")
+    def recognizer_info():
+        r = sim.get_recognizer()
+        if r is None:
+            return jsonify({"ready": False, "error": sim.recog_error})
+        return jsonify({"ready": True, "charset": r.charset,
+                        "grid": r.grid, **r.meta})
 
     @app.route("/stream")
     def stream():

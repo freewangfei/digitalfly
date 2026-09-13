@@ -9,3 +9,4 @@ __pycache__/
 # 本地仿真产物
 *.mp4
 docs/images/*.tmp
+data/mnist/

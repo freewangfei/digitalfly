@@ -4,6 +4,7 @@
     python cli.py download          下载 MaleCNS v1.0 连接组
     python cli.py build             构建全脑带符号突触网络
     python cli.py calibrate         标定突触强度（让网络不进入自持放电）
+    python cli.py train-vision      训练手写数字/字母识别解码器
     python cli.py doctor            自检：数据规模、递质分布、群体接口、与 neuPrint 对账
     python cli.py sim --exp sugar_pe  跑糖味->伸喙实验
     python cli.py behave --what walk|forage|flight|cube  行为仿真，输出 mp4
@@ -44,6 +45,21 @@ def cmd_calibrate(args) -> int:
     return 0
 
 
+def cmd_train_vision(args) -> int:
+    from digitalfly import connectome
+    from digitalfly.handwriting import (DIGIT_LABELS, LETTER_LABELS,
+                                        download_mnist, train)
+    charset = {"digits": DIGIT_LABELS, "letters": LETTER_LABELS,
+               "both": DIGIT_LABELS + LETTER_LABELS}[args.charset]
+    if args.charset == "digits":
+        download_mnist()
+    c = connectome.load()
+    print(f"训练手写识别解码器（{args.charset}，每类 {args.reps} 个样本）")
+    train(c, charset=charset, reps=args.reps, grid=args.grid,
+          layer=args.layer, backend=args.backend, seed=args.seed)
+    return 0
+
+
 def cmd_doctor(args) -> int:
     from digitalfly.doctor import run_doctor
     return run_doctor(check_remote=not args.offline)
@@ -63,9 +79,21 @@ def cmd_sim(args) -> int:
         print(f"\n图已保存 -> {out}")
         return 0 if res["verdict"]["sugar_drives_mn9"] else 1
 
+    if args.exp == "conditioning":
+        from digitalfly.experiments import conditioning
+        r = conditioning.run(c, trials=args.trials // 30 or 10,
+                             backend=args.backend)
+        return 0 if r["specific"] else 1
+
     if args.exp == "cube_decode":
         from digitalfly.experiments import cube_decode
         cube_decode.run(c, n_trials=args.trials, backend=args.backend)
+        return 0
+
+    if args.exp == "vision":
+        from digitalfly.experiments import vision_decode
+        vision_decode.run(c, reps=max(args.trials // 10, 10),
+                          backend=args.backend)
         return 0
 
     if args.exp == "steering":
@@ -139,6 +167,16 @@ def build_parser() -> argparse.ArgumentParser:
     cal.add_argument("--backend", default=None)
     cal.set_defaults(func=cmd_calibrate)
 
+    tv = sub.add_parser("train-vision", help="训练手写字符识别解码器")
+    tv.add_argument("--charset", default="digits",
+                    choices=["digits", "letters", "both"])
+    tv.add_argument("--reps", type=int, default=40, help="每类样本数")
+    tv.add_argument("--grid", type=int, default=24)
+    tv.add_argument("--layer", default="column", choices=["column", "vpn"])
+    tv.add_argument("--seed", type=int, default=0)
+    tv.add_argument("--backend", default=None)
+    tv.set_defaults(func=cmd_train_vision)
+
     doc = sub.add_parser("doctor", help="自检")
     doc.add_argument("--offline", action="store_true",
                      help="跳过与 neuPrint 服务器的对账")
@@ -147,7 +185,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("sim", help="跑大脑仿真实验")
     s.add_argument("--exp", default="sugar_pe",
                    choices=["sugar_pe", "ablation", "steering",
-                            "cube_decode"])
+                            "cube_decode", "vision", "conditioning"])
     s.add_argument("--trials", type=int, default=300,
                    help="cube_decode 采集多少局（每局约 0.7 秒）")
     s.add_argument("--duration", type=float, default=1000.0, help="毫秒")

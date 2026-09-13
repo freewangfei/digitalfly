@@ -71,6 +71,28 @@
   .pad button{padding:9px 0;font-size:15px}
   .pad .sp{visibility:hidden}
   .err{color:var(--critical);font-size:12px;margin-top:8px}
+  #pad{width:100%;max-width:260px;aspect-ratio:1;background:#000;
+       border:1px solid var(--border);border-radius:8px;display:block;
+       margin:0 auto;cursor:crosshair;touch-action:none}
+  .pred{font-size:52px;font-weight:600;line-height:1.1;text-align:center;
+        margin:10px 0 2px}
+  .predsub{text-align:center;color:var(--ink-muted);font-size:12px}
+  .bars{margin-top:10px}
+  .bar{display:flex;align-items:center;gap:8px;margin-bottom:4px;
+       font-size:12px}
+  .bar .ch{width:16px;color:var(--ink-2);font-variant-numeric:tabular-nums}
+  .bar .track{flex:1;height:8px;background:var(--grid);border-radius:4px;
+              overflow:hidden}
+  .bar .fill{height:100%;background:var(--s1);border-radius:4px}
+  .bar .pv{width:44px;text-align:right;color:var(--ink-muted);
+           font-variant-numeric:tabular-nums}
+  #hwBrain{width:100%;border-radius:6px;margin-top:10px;display:none}
+  .fbrow{display:flex;gap:6px;flex-wrap:wrap;justify-content:center;
+         margin-top:10px}
+  .fbrow button{padding:6px 0;width:30px;font-size:13px}
+  .okbtn{border-color:var(--good)!important;color:var(--good)!important}
+  .fbnote{font-size:11.5px;color:var(--ink-muted);text-align:center;
+          margin-top:6px;min-height:16px}
 </style>
 </head>
 <body>
@@ -119,6 +141,29 @@
         「果蝇选面」那一行是免费测的：把下行神经元分 6 个子群，取发放最多的
         当作果蝇自己想拧的面，看它和求解器的一致率 —— 随机猜是 17%。<br>
         打乱步数越多搜索越慢（9 步约 1 秒，10 步约 40 秒）。</p>
+    </div>
+
+    <div class="card" id="hwCard">
+      <h2>手写识别</h2>
+      <canvas id="pad" width="280" height="280"></canvas>
+      <div class="btns mt" style="justify-content:center">
+        <button id="btnRecog" class="on">识别</button>
+        <button id="btnClear">清除</button>
+      </div>
+      <div class="pred" id="hwPred">–</div>
+      <div class="predsub" id="hwSub">用鼠标在上面写一个数字</div>
+      <div class="bars" id="hwBars"></div>
+      <img id="hwBrain" alt="识别期间的全脑活动">
+      <div id="hwFeedback" style="display:none">
+        <div class="btns mt" style="justify-content:center">
+          <button id="btnRight" class="okbtn">✓ 认对了</button>
+          <button id="btnResetFb">清空学习</button>
+        </div>
+        <div class="fbnote">认错了？点下面正确的那个：</div>
+        <div class="fbrow" id="fbChars"></div>
+      </div>
+      <div class="fbnote" id="hwFbStat"></div>
+      <p class="note" id="hwNote"></p>
     </div>
 
     <div class="card">
@@ -471,6 +516,157 @@ $('#btnNewCube').onclick = () => {
     .finally(() => { $('#btnNewCube').textContent = '换一局';
                      $('#btnNewCube').disabled = false; });
 };
+/* ---------- 手写识别 ---------- */
+const pad = $('#pad'), pg = pad.getContext('2d');
+let drawing = false, hasInk = false;
+function clearPad(){
+  pg.fillStyle = '#000'; pg.fillRect(0, 0, pad.width, pad.height);
+  hasInk = false;
+  $('#hwPred').textContent = '–';
+  $('#hwSub').textContent = '用鼠标在上面写一个数字';
+  $('#hwBars').innerHTML = '';
+  $('#hwBrain').style.display = 'none';
+  $('#hwFeedback').style.display = 'none';
+}
+clearPad();
+pg.lineWidth = 22; pg.lineCap = 'round'; pg.lineJoin = 'round';
+pg.strokeStyle = '#fff';
+function padXY(e){
+  const r = pad.getBoundingClientRect();
+  const t = e.touches ? e.touches[0] : e;
+  return [(t.clientX - r.left) * pad.width / r.width,
+          (t.clientY - r.top) * pad.height / r.height];
+}
+function down(e){ e.preventDefault(); drawing = true; hasInk = true;
+  const [x,y] = padXY(e); pg.beginPath(); pg.moveTo(x,y); pg.lineTo(x+.1,y);
+  pg.stroke(); }
+function move(e){ if(!drawing) return; e.preventDefault();
+  const [x,y] = padXY(e); pg.lineTo(x,y); pg.stroke(); }
+function up(){ drawing = false; }
+pad.addEventListener('mousedown', down); pad.addEventListener('mousemove', move);
+window.addEventListener('mouseup', up);
+pad.addEventListener('touchstart', down); pad.addEventListener('touchmove', move);
+window.addEventListener('touchend', up);
+$('#btnClear').onclick = clearPad;
+
+/* 把画布缩到 28x28，并按 MNIST 的规矩做质心居中 */
+function padPixels(n){
+  const src = pg.getImageData(0, 0, pad.width, pad.height).data;
+  const S = pad.width;
+  // 先找墨迹的包围盒
+  let x0=S, y0=S, x1=-1, y1=-1;
+  for (let y=0;y<S;y++) for (let x=0;x<S;x++){
+    if (src[(y*S+x)*4] > 20){ if(x<x0)x0=x; if(x>x1)x1=x;
+                              if(y<y0)y0=y; if(y>y1)y1=y; }
+  }
+  if (x1 < 0) return null;
+  // 等比缩放到 20x20 再放进 28x28 的中心 —— MNIST 就是这么处理的
+  const w = x1-x0+1, h = y1-y0+1, side = Math.max(w,h);
+  const inner = Math.round(n * 0.72);
+  const tmp = document.createElement('canvas');
+  tmp.width = tmp.height = n;
+  const tg = tmp.getContext('2d');
+  tg.fillStyle = '#000'; tg.fillRect(0,0,n,n);
+  tg.imageSmoothingEnabled = true;
+  const dw = Math.max(1, Math.round(w/side*inner));
+  const dh = Math.max(1, Math.round(h/side*inner));
+  tg.drawImage(pad, x0, y0, w, h, (n-dw)/2, (n-dh)/2, dw, dh);
+  const d = tg.getImageData(0,0,n,n).data;
+  const out = new Array(n*n);
+  for (let i=0;i<n*n;i++) out[i] = d[i*4]/255;
+  return out;
+}
+
+let hwGrid = 24, hwCharset = '0123456789';
+
+function fbStat(d){
+  if (d.n_feedback){
+    $('#hwFbStat').textContent =
+      `已反馈 ${d.n_feedback} 次　你的样本上首次命中率 ` +
+      `${(d.user_accuracy*100).toFixed(0)}%`;
+  }
+}
+
+fetch('/api/recognizer').then(r=>r.json()).then(m => {
+  if (!m.ready){
+    $('#hwNote').textContent = '解码器未训练：先跑 python cli.py train-vision。'
+      + (m.error ? '（' + m.error + '）' : '');
+    $('#btnRecog').disabled = true;
+    return;
+  }
+  hwGrid = m.grid; hwCharset = m.charset;
+  $('#fbChars').innerHTML = [...hwCharset].map(ch =>
+    `<button data-ch="${ch}">${ch}</button>`).join('');
+  $('#fbChars').querySelectorAll('button').forEach(b => {
+    b.onclick = async () => {
+      const r = await fetch('/api/feedback', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({true: b.dataset.ch})}).then(x=>x.json());
+      if (!r.ok){ $('#hwFbStat').textContent = r.error; return; }
+      $('#hwPred').textContent = r.after;
+      $('#hwSub').textContent =
+        `已学：${r.before} → ${r.true}　现在给 ${r.true} 的概率 ` +
+        `${(r.confidence*100).toFixed(0)}%`;
+      fbStat(r);
+    };
+  });
+  $('#btnRight').onclick = async () => {
+    const cur = $('#hwPred').textContent;
+    if (!hwCharset.includes(cur)) return;
+    const r = await fetch('/api/feedback', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({true: cur})}).then(x=>x.json());
+    if (r.ok){ $('#hwSub').textContent = `已确认是 ${cur}，读出层已强化`;
+               fbStat(r); }
+  };
+  $('#btnResetFb').onclick = async () => {
+    await fetch('/api/feedback', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({action:'reset'})});
+    $('#hwFbStat').textContent = '在线学习已清空，回到离线训练的基础模型';
+  };
+  $('#hwNote').innerHTML =
+    `图像按数据集自带的六角视柱坐标铺到复眼上，驱动 L1(ON)/L2(OFF)，` +
+    `再从髓质视柱读出群体活动，最后由一个线性解码器给出字符。<br>` +
+    `<b>果蝇本身不认识数字</b> —— 突触权重一个都没变，学习只发生在最外层的` +
+    `解码器上，这和"从猴子 V1 解码光栅朝向"是同一类操作。<br>` +
+    `识别时右边会画出这次全脑哪些神经元亮了。认错了可以直接告诉它正确答案，` +
+    `<b>读出层会就地学习</b>（连接组的突触仍然一个都不动）。<br>` +
+    `留出集准确率 ${(m.accuracy*100).toFixed(0)}%　` +
+    `像素基线 ${(m.pixel_baseline*100).toFixed(0)}%　` +
+    `打乱对照 ${(m.shuffled_mean*100).toFixed(0)}%　样本 ${m.source}`;
+});
+
+$('#btnRecog').onclick = async () => {
+  if (!hasInk){ $('#hwSub').textContent = '先写一个字符'; return; }
+  const px = padPixels(hwGrid);
+  if (!px){ $('#hwSub').textContent = '画布是空的'; return; }
+  $('#btnRecog').disabled = true;
+  $('#hwPred').textContent = '…';
+  $('#hwSub').textContent = '正在把图像送进果蝇的复眼…';
+  try {
+    const r = await fetch('/api/recognize', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({pixels: px})}).then(x=>x.json());
+    if (!r.ok){ $('#hwPred').textContent = '?';
+                $('#hwSub').textContent = r.error; return; }
+    $('#hwPred').textContent = r.prediction;
+    $('#hwSub').textContent =
+      `置信度 ${(r.confidence*100).toFixed(0)}%　全脑 ${r.brain_hz.toFixed(1)} Hz`;
+    const top = Object.entries(r.probs).sort((a,b)=>b[1]-a[1]).slice(0,5);
+    $('#hwBars').innerHTML = top.map(([ch,p]) =>
+      `<div class="bar"><span class="ch">${ch}</span>` +
+      `<span class="track"><span class="fill" style="width:${(p*100).toFixed(1)}%"></span></span>` +
+      `<span class="pv">${(p*100).toFixed(1)}%</span></div>`).join('');
+    if (r.brain_png){
+      $('#hwBrain').src = 'data:image/jpeg;base64,' + r.brain_png;
+      $('#hwBrain').style.display = 'block';
+    }
+    $('#hwFeedback').style.display = 'block';
+    fbStat(r);
+  } finally { $('#btnRecog').disabled = false; }
+};
+
 let splitOn = true;
 $('#btnSplit').onclick = () => {
   splitOn = !splitOn;

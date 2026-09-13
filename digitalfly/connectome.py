@@ -108,7 +108,11 @@ def build(modulator_sign: float = UNKNOWN_SIGN,
                 # 的糖味/苦味通路），是定位味觉通路的依据
                 "synonyms", "flywireType", "hemibrainType",
                 # 胞体的三维坐标（14.2 万个神经元有），用来画全脑点云
-                "somaLocation"]
+                "somaLocation",
+                # 视叶的六角视柱坐标（2.37 万个柱状神经元有）。
+                # 这是数据集自带的视网膜拓扑图：每个 (hex1, hex2) 对应一个视柱，
+                # 每只眼约 880 个柱。视觉输入就是按这套坐标呈现的。
+                "assignedOlHex1", "assignedOlHex2"]
     ann = pd.read_feather(config.raw_path("annotations"), columns=ann_cols)
     log(f"  标注表: {len(ann):,} 行")
 
@@ -145,6 +149,11 @@ def build(modulator_sign: float = UNKNOWN_SIGN,
     for k, axis in enumerate("xyz"):
         ann[f"soma_{axis}"] = [_xyz(v, k) for v in loc]
     log(f"  胞体坐标: {int(ann['soma_x'].notna().sum()):,} 个神经元有")
+    ann = ann.rename(columns={"assignedOlHex1": "hex1",
+                              "assignedOlHex2": "hex2"})
+    n_hex = int(ann["hex1"].notna().sum())
+    log(f"  视柱坐标: {n_hex:,} 个柱状神经元有，"
+        f"{ann.dropna(subset=['hex1']).groupby(['hex1', 'hex2']).ngroups} 个视柱")
 
     meta = ann.merge(nt, on="bodyId", how="left")
     meta["nt"] = meta["nt"].fillna("unknown")

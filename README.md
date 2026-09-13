@@ -103,6 +103,9 @@ python cli.py sim --exp sugar_pe     # sugar → proboscis extension
 python cli.py sim --exp ablation     # ablation experiment
 python cli.py sim --exp steering     # can the connectome read odour laterality?
 python cli.py sim --exp cube_decode  # can it decode the next cube move?
+python cli.py sim --exp vision       # can it tell digits apart?
+python cli.py sim --exp conditioning # the fly learning with its own synapses
+python cli.py train-vision           # train the handwriting read-out
 
 python cli.py behave --what walk     # walking
 python cli.py behave --what forage   # foraging
@@ -110,7 +113,7 @@ python cli.py behave --what flight   # tethered flight
 python cli.py behave --what cube     # solving a Rubik's cube
 
 python cli.py web --port 8080        # interactive web console
-pytest tests/                        # 55 tests
+pytest tests/                        # 74 tests
 ```
 
 ---
@@ -406,6 +409,164 @@ entirely on the network.
 
 ---
 
+## Handwriting recognition — the first strong positive
+
+```bash
+python cli.py train-vision --charset digits --reps 250   # train the decoder
+python cli.py web --port 8080                            # draw with the mouse
+```
+
+Every "cognitive" probe so far came back negative — the connectome could not read
+odour laterality, could not decode a cube move. Vision is different, and the reason
+is structural: **this input goes down the path the fly actually sees with.**
+
+### How the image gets into the eye
+
+The MaleCNS annotation table gives **hexagonal ommatidial coordinates**
+(`assignedOlHex1/2`) for 23,720 optic-lobe columnar neurons — about **892 columns
+per eye**. That is the dataset's own retinotopic map, so the image is laid onto the
+eye column by column rather than projected in arbitrarily.
+
+What gets driven is **L1 and L2**, the two principal postsynaptic targets of
+photoreceptors in the lamina — the ON and OFF channels (Joesch et al., *Nature*
+2010). The photoreceptors themselves have no column coordinates in this dataset:
+their somata sit in the retina, outside the imaged volume, so only 28 of 6,098 have
+coordinates at all. Entering at the lamina is the honest choice.
+
+Readout is the **rest of each column** (Mi1, Tm1, Tm2, T1, C3 …) with L1/L2
+excluded — reading the driven cells back would just be reading the input.
+
+![retina mapping](docs/images/retina.png)
+
+*Each pair: the original handwritten digit, and the same digit reconstructed from
+what the 892 hexagonal columns sample — the mapping is faithful.*
+
+### Results
+
+Trained on **real MNIST handwriting** (Google GCS mirror, 9.9 MB):
+
+| | accuracy |
+|---|---|
+| **Decoded from the fly's visual system** | **83.7%** |
+| Pixel baseline (linear model on the raw image) | 84.3% |
+| Shuffled labels | 10.9% ± 1.9% |
+| Chance | 10.0% |
+
+**The network retains 99% of the linearly decodable information.** The remaining gap
+to a perfect score is the linear decoder and the sample count, not the fly — the
+pixel baseline itself caps around 88% at this training-set size.
+
+Compare with the cube (15.6% vs 16.6% shuffled): same decoder, same protocol, same
+brain. The difference is entirely whether the stimulus enters through a sensory
+system the animal evolved to process.
+
+### Draw it yourself
+
+The web console has a canvas: draw a digit with the mouse, press **识别 / Recognise**,
+and the drawing is scaled MNIST-style (bounding box → 72% of the frame → centred),
+laid onto both eyes, run through the whole-brain network, and read out.
+
+**What this is, precisely.** It is neural decoding — the same operation as decoding
+grating orientation from monkey V1 population activity. **The fly does not know what
+a digit is.** No synaptic weight changes; nothing in the network learns. The learning
+happens entirely in the outermost linear read-out.
+
+One bug worth recording: the encoder configuration has to be saved alongside the
+weights. After `probe_ms` was changed from 120 to 180 ms, inference silently used a
+different feature scale from training, the normalised logits saturated, and every
+drawing came back as "5" with 100% confidence. The model file now pins
+`grid / layer / peak_hz / settle_ms / probe_ms`.
+
+---
+
+## The fly learning by itself — mushroom body plasticity
+
+```bash
+python cli.py sim --exp conditioning
+```
+
+In the handwriting section, **learning happens in an external linear read-out** —
+the fly does not learn. This section is different: what changes is **the
+connectome's own 61,210 KC→MBON synapses**, using the fly's own learning rule.
+No backpropagation, no external model.
+
+### The circuit is already there
+
+| | count |
+|---|---|
+| Kenyon cells (sparse coding layer) | 4,064 |
+| MBONs (output, drive approach/avoid) | 97 |
+| Dopaminergic neurons (teaching signal) | 340 |
+| **Plastic KC→MBON synapses** | **61,210, total weight 463,640** |
+| Antennal lobe projection neurons → KC | 22,586 |
+
+The rule is **dopamine-gated synaptic depression**: when a compartment's DAN
+fires, the KC→MBON synapses of the Kenyon cells active at that moment are
+depressed (Hige et al., *Neuron* 2015; Aso & Rubin, *eLife* 2016).
+
+### Results
+
+Odour A paired with dopamine for 10 trials:
+
+| | punished compartment | control compartment |
+|---|---|---|
+| Odour A (paired), before | 111.9 Hz | 84.8 Hz |
+| Odour A (paired), after | **68.3 Hz** | 83.7 Hz |
+| Odour B (unpaired), before | 82.5 Hz | 47.3 Hz |
+| Odour B (unpaired), after | 88.9 Hz | 50.6 Hz |
+
+**Paired −39.0%, unpaired +7.8%, 5.0× specificity.** Total plastic weight falls
+to 93.3%.
+
+Note the valence flip: before training A's punished compartment was *above* its
+control (111.9 vs 84.8); after training it is *below* (68.3 vs 83.7) — the neural
+correlate of a conditioned fly reversing its preference.
+
+### Two model additions, stated plainly
+
+**1. Sparse coding is imposed, not emergent.** In a real fly the giant GABAergic
+APL neuron holds KC activity at ~5%, which is what makes learning odour-specific.
+In this reconstruction KCs receive **7.3× more excitation than inhibition**
+(1.84M vs 251k) and APL is only 2 neurons — it cannot hold back 643k recurrent
+KC→KC connections. Measured: any input lights all 4,064 KCs at 145 Hz. So the top
+5% is selected explicitly, doing what APL does in the animal.
+
+**2. Sparsening must be relative to each KC's own baseline.** Taking the raw top
+5% selects the cells with the strongest intrinsic drive regardless of stimulus —
+measured overlap between two odours' KC codes was **73%**, *higher* than the
+overlap of the inputs themselves (25%), meaning the network was increasing
+correlation. Normalising by each KC's own mean and standard deviation drops the
+overlap to **0%**. This corresponds to KC adaptation and gain control.
+
+The learning rule, the identity and count of the plastic synapses, and the
+teaching pathway all come from the connectome.
+
+### Why recognition cannot be trained the same way
+
+It was tried and it does not work, for an anatomical reason: **the visual pathway
+into the mushroom body is too weak.**
+
+- Visual projection neurons → Kenyon cells: 1,616 connections, weight 11,094
+- Antennal lobe projection neurons → Kenyon cells: 22,586, weight 390,928 (**35×**)
+
+Vision supplies 0.5% of a Kenyon cell's total input. The literature says visual MB
+input targets the KCγd subtype (ventral accessory calyx), and this dataset confirms
+it: 206 KCg-d cells take 8,041 of the visual weight, 7.1% of their input. But even
+amplifying those existing synapses 25× leaves digit separability at **1.02**
+(1.0 = indistinguishable) — because the signal already fails to distinguish digits
+by the time it reaches the visual projection neurons.
+
+This matches a pattern that recurs throughout the project and is worth stating
+once:
+
+> **At the calibrated operating point the network reliably transmits about one
+> synapse.** Beyond that it either decays to zero or saturates.
+> Gets through: retina→medulla (1 synapse, 85.8% decoding) · ALPN→KC (22,586-connection
+> pathway) · taste GRN→MN9 (needs saturating drive)
+> Does not: medulla→VPN→KC (weak, multi-synapse) · bilateral odour→descending asymmetry
+
+---
+
 ## Web console
 
 ```bash
@@ -475,9 +636,13 @@ digitalfly/
   cube.py        cube state, moves, IDA* solver (pure Python, no dependencies)
   cube_scene.py  cube MuJoCo geometry and layer-turn animation
   brainview.py   whole-brain 3D point cloud (real soma coordinates)
+  vision.py      retinotopic image presentation (hex ommatidial coords)
+  handwriting.py MNIST training + recogniser with online feedback
+  plasticity.py  mushroom body: dopamine-gated KC→MBON depression
   doctor.py      self-check and reconciliation against neuPrint
   viz.py         plots and video
-  experiments/   sugar_pe · ablation · steering (negative) · cube_decode (negative)
+  experiments/   sugar_pe · ablation · steering (neg) · cube_decode (neg)
+                 vision_decode (positive) · conditioning (the fly learns)
   web/           Flask + SSE + MJPEG interactive console
 tools/ipv4.py    IPv4-forcing launcher (see below)
 ```
