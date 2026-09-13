@@ -125,6 +125,9 @@ class FlyBody:
         self.data = self.physics.data.ptr
         self.h, self.w = render_size
         self._renderer = None
+        # 自由视角的状态（方位角 / 仰角 / 距离），由 Web 端鼠标拖动驱动
+        self._orbit_cam = None
+        self._orbit = {"azimuth": 135.0, "elevation": -20.0, "distance": 1.4}
 
         n = self.model.nu
         self.act_names = [
@@ -250,9 +253,57 @@ class FlyBody:
         ]).astype(np.float32)
 
     # -- 渲染 --------------------------------------------------------------
+    def set_orbit(self, azimuth: float | None = None,
+                  elevation: float | None = None,
+                  distance: float | None = None) -> dict:
+        """设置自由视角（绕果蝇转）。Web 端鼠标拖动改的就是这三个数。"""
+        o = self._orbit
+        if azimuth is not None:
+            o["azimuth"] = float(azimuth) % 360.0
+        if elevation is not None:
+            o["elevation"] = float(np.clip(elevation, -89.0, 89.0))
+        if distance is not None:
+            o["distance"] = float(np.clip(distance, 0.15, 20.0))
+        return dict(o)
+
+    @property
+    def orbit(self) -> dict:
+        return dict(self._orbit)
+
+    def _orbit_camera(self):
+        """跟随躯干的自由相机 —— 果蝇走到哪都在画面里。"""
+        if self._orbit_cam is None:
+            cam = self.mj.MjvCamera()
+            body_id = -1
+            for nm in ("thorax", "torso", "fly"):
+                try:
+                    body_id = self.mj.mj_name2id(
+                        self.model, self.mj.mjtObj.mjOBJ_BODY, nm)
+                except Exception:                        # noqa: BLE001
+                    body_id = -1
+                if body_id >= 0:
+                    break
+            if body_id >= 0:
+                cam.type = self.mj.mjtCamera.mjCAMERA_TRACKING
+                cam.trackbodyid = body_id
+            else:
+                cam.type = self.mj.mjtCamera.mjCAMERA_FREE
+            self._orbit_cam = cam
+        cam = self._orbit_cam
+        o = self._orbit
+        cam.azimuth = o["azimuth"]
+        cam.elevation = o["elevation"]
+        cam.distance = o["distance"]
+        if cam.type == self.mj.mjtCamera.mjCAMERA_FREE:
+            cam.lookat[:] = self.root_pos
+        return cam
+
     def render(self, camera: str | int = -1) -> np.ndarray:
         if self._renderer is None:
             self._renderer = self.mj.Renderer(self.model, self.h, self.w)
+        if camera == "orbit":
+            self._renderer.update_scene(self.data, camera=self._orbit_camera())
+            return self._renderer.render()
         cam = camera
         if isinstance(camera, str):
             cam = (self.camera_names.index(camera)

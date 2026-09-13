@@ -67,7 +67,10 @@ class Simulation:
         self.raster_idx = rng.choice(self.brain.n, size=raster_size,
                                      replace=False)
 
-        self.lock = threading.RLock()
+        # 两把锁：脑线程和身体线程各用各的，否则身体那几百个物理子步会把脑
+        # 挡在锁外面 —— 实测共用一把锁时脑只能推进到真实时间的 1%。
+        self.lock = threading.RLock()        # 大脑与共享状态
+        self.blk = threading.RLock()         # 身体与渲染
         self.running = True
         self.stim: dict[str, float] = {}
         self.ablated: set[str] = set()
@@ -76,6 +79,9 @@ class Simulation:
         self.error: str | None = None
         self._stop = threading.Event()
         self._ext = np.zeros(self.brain.n, dtype=np.float32)
+        self._last_spikes = np.zeros(self.brain.n, dtype=np.float32)
+        self.cmd = None
+        self._minfo: dict = {}       # 身体线程写、脑线程读的运动状态
         self._group_cache: dict[str, np.ndarray] = {}
 
         # 手动接管：None 表示交给大脑
@@ -109,20 +115,30 @@ class Simulation:
 
         if name not in BEHAVIOR_LABELS:
             raise ValueError(f"未知行为 {name}")
-        with self.lock:
+        with self.lock, self.blk:
             if self.body is not None:
                 self.body.close()
             self.behavior = name
             self.scene = None
             if name == "cube":
                 from ..cube_scene import CubeScene
-                self.scene = CubeScene(size=0.55, pos=(0.55, 0.0, 0.28))
+                # 魔方尺寸取得和果蝇差不多大 —— 网上那些视频里就是这个比例，
+                # 也只有这个尺度前腿才够得着面。
+                CUBE = 0.26
+                self.scene = CubeScene(size=CUBE,
+                                       pos=(0.42, 0.0, CUBE / 2))
                 self.body = FlyBody(mode="walk", render_size=(360, 480),
                                     cube_scene=self.scene)
                 self.scene.bind(self.body.model, self.body.data)
                 self._new_cube()
             else:
                 self.body = FlyBody(mode=name, render_size=(360, 480))
+            # Web 交互模式把物理步长从 0.1 ms 放大到 0.4 ms。flybody 默认的
+            # 0.1 ms 在这台机器上纯物理只跑到真实时间的 0.25 倍，画面必然是慢动作。
+            # 实测 0.4 ms 仍然稳定（不发散、不摔倒），步速 1.31 vs 1.07 体长/秒，
+            # 而速度提到 1.18 倍真实时间；0.8 ms 接触就失效了（速度掉到 0.42）。
+            # 离线出视频的 `behave` 命令仍用 0.1 ms，保真度不受影响。
+            self.body.model.opt.timestep = 4e-4
             self.gait = self.wings = None
             if name == "flight":
                 self.dt_ctrl = 2e-4
@@ -132,9 +148,10 @@ class Simulation:
             else:
                 self.gait = PreprogrammedGait(self.body)
                 self.dt_ctrl = self.brain.p.dt / 1000.0 * CTRL_EVERY
-            self.cameras = self.body.camera_names
-            want = {"cube": "cube_cam", "flight": "flight_close"}.get(
-                name, "track1")
+            # "orbit" = 可鼠标拖动的自由视角，放在最前面作为默认
+            self.cameras = ["orbit"] + list(self.body.camera_names)
+            want = {"cube": "orbit", "flight": "flight_close"}.get(
+                name, "orbit")
             if name in ("cube", "flight") or self.camera not in self.cameras:
                 self.camera = (want if want in self.cameras
                                else self.cameras[0])
@@ -203,7 +220,7 @@ class Simulation:
         return len(idx)
 
     def reset(self) -> None:
-        with self.lock:
+        with self.lock, self.blk:
             self.stim.clear()
             self.ablated.clear()
             self._fresh()
@@ -213,21 +230,22 @@ class Simulation:
         from PIL import Image
 
         dt_brain = self.brain.p.dt / 1000.0
-        push_every = int(round(0.05 / dt_brain))
         window = np.zeros(self.brain.n, dtype=np.float32)
         window_steps = 0
         raster_buf: list[np.ndarray] = []
         t_wall = time.time()
         info: dict = {}
+        t_push = 0.0
+        PUSH_DT = 0.1
 
         while not self._stop.is_set():
             if not self.running:
                 time.sleep(0.05)
                 continue
             try:
+                now = time.time()
                 with self.lock:
-                    spikes, info = self._advance(dt_brain)
-                    i = self.step_i
+                    spikes, info = self._advance(dt_brain, dt_body=0.0)
                     self.step_i += 1
             except Exception as e:                        # noqa: BLE001
                 self.error = f"{type(e).__name__}: {e}"
@@ -238,7 +256,8 @@ class Simulation:
             window_steps += 1
             raster_buf.append(spikes[self.raster_idx].astype(np.uint8))
 
-            if i % push_every == 0 and window_steps:
+            if now - t_push >= PUSH_DT and window_steps:
+                t_push = now
                 secs = window_steps * dt_brain
 
                 def rate_of(v):
@@ -267,8 +286,10 @@ class Simulation:
                     "manual_turn": self.manual_turn,
                     "food": self.food_xy,
                     "odor_on": self.odor_on,
+                    "body_time": round(float(self.body.data.time), 2),
                     "error": self.error,
                     **info,
+                    **self._minfo,
                 }
                 window[:] = 0.0
                 window_steps = 0
@@ -277,9 +298,42 @@ class Simulation:
 
             self.view.update(spikes, dt_brain * 1000)
 
-            if i % push_every == 0:
+    def body_loop(self) -> None:
+        """身体 + 渲染线程：按**真实流逝的时间**推进物理，按固定帧率出图。
+
+        和脑线程分开跑的原因：全脑一步要 3.5 ms，脑只能跑到真实时间的 14%，
+        身体要是跟着脑步走，画面就是 3 FPS。拆开之后身体是实时的（20+ FPS），
+        脑仍然在闭环里 —— 它通过 self.cmd 这条低带宽通道给出速度与转向。
+        """
+        from PIL import Image
+
+        FRAME_DT = 1.0 / 25.0
+        t_body = time.time()
+        t_frame = 0.0
+        while not self._stop.is_set():
+            now = time.time()
+            if not self.running:
+                time.sleep(0.03)
+                t_body = now
+                continue
+            # 单次最多补 60 ms，防止卡顿之后身体瞬移
+            dt_body = min(now - t_body, 0.06)
+            t_body = now
+            try:
+                cmd = getattr(self, "cmd", None)
+                if cmd is not None and dt_body > 0:
+                    odor_l, odor_r, taste = getattr(self, "sense",
+                                                    (0.0, 0.0, 0.0))
+                    with self.blk:
+                        self._motion(dt_body, cmd, self._last_spikes,
+                                     self._minfo, odor_l, odor_r, taste)
+            except Exception as e:                        # noqa: BLE001
+                self.error = f"{type(e).__name__}: {e}"
+
+            if now - t_frame >= FRAME_DT:
+                t_frame = now
                 try:
-                    with self.lock:
+                    with self.blk:
                         px = self.body.render(self.camera)
                     if self.split:
                         from ..brainview import draw_overlay, side_by_side
@@ -296,9 +350,24 @@ class Simulation:
                     self.frame = buf.getvalue()
                 except Exception:                        # noqa: BLE001
                     pass
+            else:
+                time.sleep(0.004)
 
-    def _advance(self, dt_brain: float) -> tuple[np.ndarray, dict]:
-        """推进一个脑步，返回 (脉冲向量, 行为状态)。"""
+    def _advance(self, dt_brain: float,
+                 dt_body: float | None = None) -> tuple[np.ndarray, dict]:
+        """推进一个脑步 + dt_body 秒的身体，返回 (脉冲向量, 行为状态)。
+
+        **脑和身体是解耦的。** 脑必须按 0.5 ms 步长积分（LIF 的时间常数决定），
+        全脑 185,348 个神经元、26,006,173 条突触，在 5090 上一步约 3.5 ms ——
+        也就是说脑只能跑到真实时间的 14%。如果身体跟着脑步走，画面就是 3 FPS，
+        看起来一卡一卡的。
+
+        所以拆成两个线程：**脑线程**全速积分，把 speed / turn 指令写进 self.cmd；
+        **身体线程**按真实流逝的时间推进物理并渲染。脑给的是低带宽指令，步态本身
+        由真实运动学生成，所以降低指令更新频率不影响行为正确性，只影响脑内动力学
+        与身体的时间对齐 —— 代价写在这里：脑的仿真时间比身体慢约 7 倍。要严格
+        1:1 的话用 `behave` 命令离线出视频。
+        """
         body, br = self.body, self.bridge
         info: dict = {}
 
@@ -336,9 +405,38 @@ class Simulation:
         spikes = self.brain.step(self._ext)
         cmd = br.read_command(spikes)
         info["cmd_speed"] = round(cmd.speed, 2)
+        # 供身体线程读取的最新指令（脑 -> 身体只走这一条低带宽通道）
+        self.cmd = cmd
+        self.sense = (odor_l, odor_r, taste)
+        self._last_spikes = spikes
+        if dt_body is None:
+            # 离线 1:1 模式：脑步之后紧跟身体步
+            self._motion(dt_brain, cmd, spikes, info, odor_l, odor_r, taste)
+        if self.behavior == "cube":
+            info.update(self._advance_cube(dt_brain, spikes))
+        info["turn"] = round(self.cur_turn, 3)
+        info["speed"] = round(self.cur_speed, 2)
+        return spikes, info
 
-        # --- 运动 -------------------------------------------------------
-        sub = max(1, int(round(dt_brain / body.timestep)))
+    # 运动指令的细分步长。果蝇一个步周期只有 50~100 ms，如果把整个 40 ms 的
+    # 真实间隔一次性喂给步态发生器，相位一次就跳掉半个周期，腿会瞬移、打滑。
+    # 2 ms 一档，相位推进才是连续的。
+    MOTION_DT = 0.005
+
+    def _motion(self, dt_b: float, cmd, spikes, info: dict,
+                odor_l: float, odor_r: float, taste: float) -> None:
+        """按 dt_b 秒推进身体，内部细分成 MOTION_DT 的小步。"""
+        n_sub = max(1, int(np.ceil(dt_b / self.MOTION_DT)))
+        dt_one = dt_b / n_sub
+        for _ in range(n_sub):
+            self._motion_once(dt_one, cmd, spikes, info,
+                              odor_l, odor_r, taste)
+
+    def _motion_once(self, dt_b: float, cmd, spikes, info: dict,
+                     odor_l: float, odor_r: float, taste: float) -> None:
+        body, br = self.body, self.bridge
+        dt_brain = self.brain.p.dt / 1000.0
+        sub = max(1, int(round(dt_b / body.timestep)))
         if self.behavior == "flight":
             turn = (self.manual_turn if self.manual_turn is not None
                     else float(np.clip(0.6 * cmd.turn, -0.8, 0.8)))
@@ -352,7 +450,9 @@ class Simulation:
             info["wing_stroke"] = round(
                 float(body.data.qpos[self.wings.qadr[0]]), 2)
         else:
-            if self.step_i % CTRL_EVERY == 0:
+            # 身体线程每次都更新运动指令 —— 步态相位推进的时长必须和身体推进的
+            # 时长一致，否则腿会拖在地上滑。
+            if True:
                 if self.manual_turn is not None:
                     turn = self.manual_turn
                 elif self.behavior == "forage" and self.odor_on:
@@ -360,9 +460,15 @@ class Simulation:
                     diff = (odor_l - odor_r) / max(odor_l + odor_r, 1e-6)
                     turn = float(np.clip(8.0 * diff, -0.5, 0.5))
                 elif self.behavior == "cube":
-                    # 绕着魔方转圈，免得走出画面
-                    from ..behaviors import _orbit
-                    turn = _orbit(body, self.scene.origin[:2], radius=0.55)
+                    # 走到魔方跟前、正对着它停下 —— 然后才用前腿去拨
+                    from ..cube_hands import approach
+                    sp, turn, self.cube_arrived = approach(
+                        body, self.scene.origin[:2],
+                        stop_dist=self.scene.size / 2 + 0.09)
+                    if self.cube_arrived:
+                        self.manual_speed_cube = 0.0
+                    else:
+                        self.manual_speed_cube = sp
                 else:
                     h = body.heading()
                     err = float(self.h0[0] * h[1] - self.h0[1] * h[0])
@@ -370,11 +476,15 @@ class Simulation:
                                          -0.5, 0.5))
                 speed = (self.manual_speed if self.manual_speed is not None
                          else float(np.clip(cmd.speed, 0.35, 1.0)))
+                if self.behavior == "cube":
+                    speed = getattr(self, "manual_speed_cube", speed)
                 if taste:
                     speed = 0.0
                 self.cur_turn, self.cur_speed = turn, speed
-                self.gait.step(self.ctrl, self.dt_ctrl, speed=speed,
-                               turn=turn, adhesion=0.5)
+                self.gait.step(self.ctrl, dt_b, speed=speed, turn=turn,
+                               adhesion=0.5)
+                if self.behavior == "cube":
+                    self._cube_leg(self.ctrl)
 
                 if self.behavior == "forage":
                     # 伸喙由 MN9 的发放驱动 —— 这一段是连接组算出来的
@@ -392,13 +502,31 @@ class Simulation:
                     info["proboscis"] = round(self.proboscis, 2)
             body.step(self.ctrl, n_substeps=sub)
             info["fallen"] = body.fallen()
+            if self.behavior == "cube":
+                if (self.scene.advance(dt_b)
+                        and self.scene.state.is_solved()):
+                    self.cube_solved_at = self.brain.t_ms / 1000.0
+                self.scene.write()
 
-        if self.behavior == "cube":
-            info.update(self._advance_cube(dt_brain, spikes))
+    def _cube_leg(self, ctrl) -> None:
+        """魔方转动期间，把对应那条前腿的"伸手 + 拨"姿态叠加到步态之上。
 
-        info["turn"] = round(self.cur_turn, 3)
-        info["speed"] = round(self.cur_speed, 2)
-        return spikes, info
+        腿的相位和面的转角用的是同一个 anim_t/anim_dur，所以看上去是这一拨
+        把面推过去的。接触本身是运动学同步，不是物理摩擦驱动 —— 见 cube_hands。
+        """
+        from ..cube_hands import FACE_SIDE, FrontLegReach
+        if not hasattr(self, "_legs"):
+            self._legs = FrontLegReach(self.body)
+        if not self._legs.available():
+            return
+        sc = self.scene
+        if sc.anim_face is None or not getattr(self, "cube_arrived", False):
+            return
+        phase = min(sc.anim_t / max(sc.anim_dur, 1e-6), 1.0)
+        side = FACE_SIDE.get(sc.anim_face, "right")
+        # 两头淡入淡出，别在拨完的瞬间把腿弹回步态
+        blend = float(np.clip(min(phase, 1.0 - phase) * 6.0, 0.0, 1.0))
+        self._legs.apply(ctrl, side, phase, blend=blend)
 
     def _advance_cube(self, dt_brain: float, spikes: np.ndarray) -> dict:
         """魔方：连接组决定「什么时候拧」，求解器决定「拧哪一面」。"""
@@ -430,10 +558,8 @@ class Simulation:
             self._cube_win[:] = 0.0
             self._cube_steps = 0
 
-        if self.scene.advance(dt_brain) and self.scene.state.is_solved():
-            self.cube_solved_at = self.brain.t_ms / 1000.0
-        self.scene.write()
-
+        # 动画的推进放在身体线程（见 _motion_once）—— 脑只跑到真实时间的
+        # 三分之一，挂在脑上的话转动会拖成慢动作。
         n = len(self.cube_agree)
         return {
             "cube_move": self.cube_i,
@@ -482,6 +608,7 @@ def create_app(backend: str | None = None,
     app = Flask(__name__, static_folder=None)
     sim = Simulation(backend=backend, behavior=behavior)
     threading.Thread(target=sim.loop, daemon=True).start()
+    threading.Thread(target=sim.body_loop, daemon=True).start()
 
     @app.route("/")
     def index():
@@ -527,6 +654,15 @@ def create_app(backend: str | None = None,
                 sim.split = bool(req.get("on", True))
             elif action == "camera":
                 sim.camera = req["value"]
+            elif action == "orbit":
+                # 鼠标拖动：左右拖改方位角，上下拖改仰角，滚轮改距离
+                with sim.lock:
+                    o = sim.body.set_orbit(
+                        azimuth=req.get("azimuth"),
+                        elevation=req.get("elevation"),
+                        distance=req.get("distance"))
+                sim.camera = "orbit"
+                return jsonify({"ok": True, "orbit": o})
             elif action == "manual":
                 sim.manual_speed = (None if req.get("speed") is None
                                     else float(req["speed"]))

@@ -226,7 +226,8 @@
     <div class="grid2">
       <div class="card">
         <h2>身体 · MuJoCo 物理仿真</h2>
-        <img id="video" alt="果蝇身体实时渲染">
+        <img id="video" alt="果蝇身体实时渲染" draggable="false">
+        <p class="note">拖动画面旋转视角 · 滚轮缩放 · 双击复位</p>
         <div class="btns mt" id="cameras"></div>
       <div class="btns mt"><button id="btnSplit" class="on">分屏：脑活动</button></div>
         <p class="note" id="bodyNote"></p>
@@ -262,6 +263,43 @@ const css = n => getComputedStyle(document.documentElement)
 const BLUE = ['#cde2fb','#b7d3f6','#9ec5f4','#86b6ef','#6da7ec','#5598e7',
               '#3987e5','#2a78d6','#256abf','#1c5cab','#184f95','#104281'];
 const ramp = t => BLUE[Math.max(0, Math.min(11, Math.round(t*11)))];
+
+// ---- 3D 自由视角：拖动旋转、滚轮缩放 ----
+const orbit = {azimuth:135, elevation:-20, distance:1.4};
+let dragging=false, lastX=0, lastY=0, orbitPending=false;
+function sendOrbit(){
+  if (orbitPending) return;
+  orbitPending = true;
+  setTimeout(() => {
+    orbitPending = false;
+    post({action:'orbit', azimuth:orbit.azimuth,
+          elevation:orbit.elevation, distance:orbit.distance});
+  }, 40);                      // 节流到 25 Hz，和渲染帧率一致
+}
+function initOrbit(){
+  const v = $('#video');
+  v.addEventListener('mousedown', e => {
+    dragging=true; lastX=e.clientX; lastY=e.clientY; e.preventDefault();
+  });
+  window.addEventListener('mouseup', () => { dragging=false; });
+  window.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    orbit.azimuth   -= (e.clientX - lastX) * 0.4;
+    orbit.elevation -= (e.clientY - lastY) * 0.3;
+    orbit.elevation = Math.max(-89, Math.min(89, orbit.elevation));
+    lastX=e.clientX; lastY=e.clientY;
+    sendOrbit();
+  });
+  v.addEventListener('wheel', e => {
+    e.preventDefault();
+    orbit.distance *= (e.deltaY > 0 ? 1.12 : 0.89);
+    orbit.distance = Math.max(0.15, Math.min(20, orbit.distance));
+    sendOrbit();
+  }, {passive:false});
+  v.addEventListener('dblclick', () => {
+    orbit.azimuth=135; orbit.elevation=-20; orbit.distance=1.4; sendOrbit();
+  });
+}
 
 async function post(body){
   const r = await fetch('/api/control', {method:'POST',
@@ -733,6 +771,7 @@ es.onmessage = ev => {
   drawRegions(d.regions); drawSeries(); drawRaster(d.raster);
 };
 window.addEventListener('resize', () => { rimg = null; drawSeries(); });
+initOrbit();
 </script>
 </body>
 </html>
