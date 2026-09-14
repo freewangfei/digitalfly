@@ -200,6 +200,68 @@ Web 界面里可以鼠标手写、点识别，并看到识别期间全脑哪些�
 
 ---
 
+## 参考的三个同类工程
+
+同一位作者（nftechie）用同一份 MaleCNS v1.0 连接组做了三件事，都提供了有价值的对照。
+
+**[doomfly](https://github.com/nftechie/doomfly)** —— 连接组打 Doom。和本项目最可比：
+
+| | doomfly | 本项目 |
+|---|---|---|
+| 视觉输入 | R1–R6 光感受器（3,335）+ R8（811） | 直接驱动 L1/L2（1,785） |
+| 可塑突触 | 4,184 条 KC→MBON11，PPL101 门控 | 61,210 条 KC→MBON（嗅觉）/ 12,710 条 L1/L2→Dm（视觉） |
+| 权重边界 | 原始强度 0.1–2 倍，η=0.001 | 0–3 倍，η=0.1 |
+| 学习结果 | 视觉、条件化、存活三项验证门**全部未通过** | 10 类 36.7% vs 随机 10% |
+
+两处独立印证：
+
+* **KC→MBON11 边数，两边都是 4,184。** 两套各自编写的 importer、各自的保留策略，
+  在同一条具名通路上给出完全相同的数 —— 比任何单方面自检都有说服力。
+* 他们的审查发现"**不应期内仍然接收突触输入**，与 Brian2 参考方程不符"并修正；
+  本项目也独立踩到并修过同一处（scipy 与 torch 两个后端的不应期差一步）。
+
+采纳过来的改进：条件化的惩罚区室从"MBON 对半分"改成**解剖学上真实的 MBON11**，
+教学信号用 2 个具名 PPL101 细胞。依据是本数据集实测 PPL101→MBON11 权重 2,311，
+第二名 MBON30 只有 101（差 23 倍）；对照区室选 MBON09，它的 KC 输入量相当
+（4,682 条 vs 4,184 条）但几乎收不到 PPL101。
+
+**[flm](https://github.com/nftechie/flm)** —— 连接组当冻结储备池接语言模型。已复现，见下节。
+
+**其他**：[fly-brain-olympiad](https://github.com/TomkeMonke/fly-brain-olympiad)（不训练大脑，
+线性读出全部神经元）、[classi-fly](https://github.com/bhodgens/classi-fly)（蘑菇体当固定随机
+投影 + 线性读出，作者自陈阴性）、[fly-brain-bench](https://github.com/RaphaelSR/fly-brain-bench)
+（APL 除性抑制恢复稀疏，但模式重叠仍有 ~70%；本项目按每个 KC 自己的基线归一后压到 0%）。
+
+---
+
+## FLM：把连接组接到语言模型上
+
+```bash
+python cli.py flm-download          # 下载冻结的 LFM2.5-1.2B（走 hf-mirror）
+python cli.py sim --exp flm         # 训练适配器 + 两组对照
+python cli.py flm-chat --prompt "What does a fly see?"
+```
+
+token 嵌入驱动整张图做 `x = tanh(W·(0.6x + 0.4·in))`，读出图的状态给语言模型的
+logits 加一个**有界修正**（最大 ±0.5）。只训那个适配器，连接组和语言模型都不动。
+
+**这一层不是脉冲仿真**：用的是抽象数值状态，没有递质符号、没有多巴胺、没有生物学时间。
+
+必须有对照，否则说明不了任何问题 —— 适配器自己就有 319 万参数：
+
+| | 测试 NLL | 相对基线改善 | 参数量 |
+|---|---|---|---|
+| 语言模型基线 | 7.4623 | — | — |
+| **fly**（连接组储备池） | 6.9068 | +0.5555 | 3,194,928 |
+| **shuffled**（打乱边，保留度分布） | 6.9087 | +0.5536 | 3,194,928 |
+| **direct**（不用储备池） | **6.8262** | **+0.6361** | 3,194,928 |
+
+**果蝇拓扑 vs 打乱拓扑差 0.0019，等于没差别；直接输入反而比果蝇好 0.0806。**
+储备池非但没帮忙，还损失了信息。这和原作者报的结论一致：**没有证据表明果蝇的
+解剖结构给语言建模带来优势**。语言能力全部来自那个预训练模型。
+
+---
+
 ## Web 控制台
 
 ```bash
@@ -236,7 +298,10 @@ python cli.py sim --exp ablation       # 切除揭示前馈抑制
 python cli.py sim --exp steering       # 气味侧别编码（阴性）
 python cli.py sim --exp cube_decode    # 魔方下一步解码（阴性）
 python cli.py sim --exp vision         # 视觉解码（阳性）
-python cli.py sim --exp conditioning   # 嗅觉联想学习
+python cli.py sim --exp conditioning   # 嗅觉联想学习（MBON11 / PPL101）
+python cli.py sim --exp flm            # 连接组接语言模型 + 两组对照
+python cli.py flm-download             # 下载冻结语言模型
+python cli.py flm-chat                 # 和果蝇说话
 python cli.py train-vision             # 训练手写识别读出层
 python cli.py behave --mode walk|forage|flight
 python cli.py web --port 8080
@@ -260,12 +325,13 @@ digitalfly/
   visual_brain.py  脑内视觉判决 + 双向可塑性 + 突触缩放
   handwriting.py   MNIST 训练 + 线性可解码上限
   plasticity.py    蘑菇体：多巴胺门控的 KC→MBON 可塑性
+  flm.py           连接组作为冻结储备池 + 语言模型适配器
   cube.py          魔方状态 + IDA* 求解器
   cube_scene.py    26 个 mocap 块的场景
   cube_hands.py    前腿拨动魔方
   brainview.py     全脑三维点云（真实胞体坐标）
   experiments/     sugar_pe · ablation · steering · cube_decode
-                   vision_decode · conditioning
+                   vision_decode · conditioning · flm_train
   web/             Flask + SSE + MJPEG 控制台
 ```
 

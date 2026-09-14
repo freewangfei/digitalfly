@@ -60,6 +60,18 @@ def cmd_train_vision(args) -> int:
     return 0
 
 
+def cmd_flm_download(args) -> int:
+    from digitalfly.flm import download
+    download()
+    return 0
+
+
+def cmd_flm_chat(args) -> int:
+    from digitalfly.flm import chat
+    print(chat(args.prompt, max_new=args.max_new, use_fly=not args.no_fly))
+    return 0
+
+
 def cmd_doctor(args) -> int:
     from digitalfly.doctor import run_doctor
     return run_doctor(check_remote=not args.offline)
@@ -84,6 +96,11 @@ def cmd_sim(args) -> int:
         r = conditioning.run(c, trials=args.trials // 30 or 10,
                              backend=args.backend)
         return 0 if r["specific"] else 1
+
+    if args.exp == "flm":
+        from digitalfly.experiments import flm_train
+        flm_train.run(c)
+        return 0
 
     if args.exp == "cube_decode":
         from digitalfly.experiments import cube_decode
@@ -177,6 +194,15 @@ def build_parser() -> argparse.ArgumentParser:
     tv.add_argument("--backend", default=None)
     tv.set_defaults(func=cmd_train_vision)
 
+    fd = sub.add_parser("flm-download", help="下载 FLM 用的冻结语言模型")
+    fd.set_defaults(func=cmd_flm_download)
+    fc = sub.add_parser("flm-chat", help="和果蝇说话（FLM 语言模型实验）")
+    fc.add_argument("--prompt", default="What does a fly see?")
+    fc.add_argument("--max-new", type=int, default=60)
+    fc.add_argument("--no-fly", action="store_true",
+                    help="关掉果蝇修正，做对照")
+    fc.set_defaults(func=cmd_flm_chat)
+
     doc = sub.add_parser("doctor", help="自检")
     doc.add_argument("--offline", action="store_true",
                      help="跳过与 neuPrint 服务器的对账")
@@ -185,7 +211,8 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("sim", help="跑大脑仿真实验")
     s.add_argument("--exp", default="sugar_pe",
                    choices=["sugar_pe", "ablation", "steering",
-                            "cube_decode", "vision", "conditioning"])
+                            "cube_decode", "vision", "conditioning",
+                            "flm"])
     s.add_argument("--trials", type=int, default=300,
                    help="cube_decode 采集多少局（每局约 0.7 秒）")
     s.add_argument("--duration", type=float, default=1000.0, help="毫秒")

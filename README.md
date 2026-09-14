@@ -257,6 +257,81 @@ olfactory pathway; even amplified 25× digit separability stays at 1.02.
 
 ---
 
+## Three reference projects
+
+The same author (nftechie) built three things on the same MaleCNS v1.0 connectome.
+All three are useful controls.
+
+**[doomfly](https://github.com/nftechie/doomfly)** — the connectome plays Doom. The
+closest comparison:
+
+| | doomfly | this project |
+|---|---|---|
+| Visual input | R1–R6 photoreceptors (3,335) + R8 (811) | L1/L2 driven directly (1,785) |
+| Plastic synapses | 4,184 KC→MBON11, PPL101-gated | 61,210 KC→MBON (olfactory) / 12,710 L1/L2→Dm (visual) |
+| Weight bounds | 0.1–2× original, η=0.001 | 0–3×, η=0.1 |
+| Learning outcome | visual, conditioning and survival gates **all failed** | 10-class 36.7% vs 10% chance |
+
+Two independent corroborations:
+
+* **KC→MBON11 edge count is 4,184 in both.** Two separately written importers with
+  different retention policies land on the same number for the same named pathway —
+  stronger evidence than either project's own self-check.
+* Their review found that "incoming synaptic signals were retained during refractory
+  periods, unlike the stated reference equations in Brian2" and fixed it. This project
+  independently hit and fixed the same bug (a refractory off-by-one between the scipy
+  and torch backends).
+
+Adopted from it: the conditioning experiment's punished compartment is now the real
+named **MBON11** rather than an arbitrary half of all MBONs, taught by the two named
+PPL101 cells. Measured here, PPL101→MBON11 carries weight 2,311 while the runner-up
+MBON30 gets 101 (23× less); the control compartment is MBON09, which has comparable
+KC input (4,682 vs 4,184 edges) but receives essentially no PPL101.
+
+**[flm](https://github.com/nftechie/flm)** — the connectome as a frozen reservoir
+feeding a language model. Reproduced below.
+
+**Others**: [fly-brain-olympiad](https://github.com/TomkeMonke/fly-brain-olympiad)
+(brain never trained; linear readout of every neuron),
+[classi-fly](https://github.com/bhodgens/classi-fly) (mushroom body as a fixed random
+projection plus linear readout; the author reports a negative result), and
+[fly-brain-bench](https://github.com/RaphaelSR/fly-brain-bench) (APL-style divisive
+inhibition restores sparseness but pattern overlap only falls to ~70%; this project's
+per-KC baseline normalisation takes it to 0%).
+
+---
+
+## FLM: wiring the connectome to a language model
+
+```bash
+python cli.py flm-download          # fetch the frozen LFM2.5-1.2B (via hf-mirror)
+python cli.py sim --exp flm         # train the adapter + two controls
+python cli.py flm-chat --prompt "What does a fly see?"
+```
+
+Token embeddings drive the whole graph through `x = tanh(W·(0.6x + 0.4·in))`; the
+graph's state produces a **bounded correction** (max ±0.5) to the language model's
+logits. Only the adapter trains; the connectome and the language model stay frozen.
+
+**This layer is not a spiking simulation** — abstract numerical state, no transmitter
+signs, no dopamine, no biological time.
+
+The controls are the whole point; the adapter alone has 3.19M parameters:
+
+| | Test NLL | Gain vs baseline | Parameters |
+|---|---|---|---|
+| Language model baseline | 7.4623 | — | — |
+| **fly** (connectome reservoir) | 6.9068 | +0.5555 | 3,194,928 |
+| **shuffled** (edges permuted, degrees kept) | 6.9087 | +0.5536 | 3,194,928 |
+| **direct** (no reservoir) | **6.8262** | **+0.6361** | 3,194,928 |
+
+**Fly vs shuffled differs by 0.0019 — no difference; direct input beats fly by 0.0806.**
+The reservoir does not help; it destroys information. This matches the original
+author's finding: **no evidence that fly anatomy helps language modelling.** All the
+language ability comes from the pretrained model.
+
+---
+
 ## Web console
 
 ```bash
@@ -298,7 +373,10 @@ python cli.py sim --exp ablation       # ablation reveals feed-forward inhibitio
 python cli.py sim --exp steering       # odour laterality (negative)
 python cli.py sim --exp cube_decode    # next cube move (negative)
 python cli.py sim --exp vision         # visual decoding (positive)
-python cli.py sim --exp conditioning   # olfactory associative learning
+python cli.py sim --exp conditioning   # olfactory learning (MBON11 / PPL101)
+python cli.py sim --exp flm            # connectome + language model, with controls
+python cli.py flm-download             # fetch the frozen language model
+python cli.py flm-chat                 # talk to the fly
 python cli.py train-vision             # train the handwriting read-out
 python cli.py behave --mode walk|forage|flight
 python cli.py web --port 8080
@@ -322,12 +400,13 @@ digitalfly/
   visual_brain.py  in-brain visual decision + bidirectional plasticity + scaling
   handwriting.py   MNIST training + linear decodability ceiling
   plasticity.py    mushroom body: dopamine-gated KC→MBON plasticity
+  flm.py           connectome as frozen reservoir + language-model adapter
   cube.py          cube state + IDA* solver
   cube_scene.py    26 mocap cubies
   cube_hands.py    front-leg cube manipulation
   brainview.py     whole-brain 3D point cloud (real soma coordinates)
   experiments/     sugar_pe · ablation · steering · cube_decode
-                   vision_decode · conditioning
+                   vision_decode · conditioning · flm_train
   web/             Flask + SSE + MJPEG console
 ```
 
