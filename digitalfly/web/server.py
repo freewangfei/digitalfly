@@ -75,6 +75,8 @@ class Simulation:
         self.stim: dict[str, float] = {}
         self.ablated: set[str] = set()
         self.frame: bytes | None = None
+        self.frame_id = 0
+        self.frame_cv = threading.Condition()
         self.latest: dict = {}
         self.error: str | None = None
         self._stop = threading.Event()
@@ -299,25 +301,26 @@ class Simulation:
             self.view.update(spikes, dt_brain * 1000)
 
     def body_loop(self) -> None:
-        """身体 + 渲染线程：按**真实流逝的时间**推进物理，按固定帧率出图。
+        """物理线程：按**真实流逝的时间**推进身体，不做渲染。
 
-        和脑线程分开跑的原因：全脑一步要 3.5 ms，脑只能跑到真实时间的 14%，
-        身体要是跟着脑步走，画面就是 3 FPS。拆开之后身体是实时的（20+ FPS），
-        脑仍然在闭环里 —— 它通过 self.cmd 这条低带宽通道给出速度与转向。
+        三条线程各司其职：脑（`loop`）全速积分并给出 speed/turn 指令，物理
+        （这里）按真实时间推进，渲染（`render_loop`）按自己的节拍出帧。
+
+        为什么必须拆成三条：全脑一步要 3.5 ms，脑只能跑到真实时间的三成，
+        身体跟着脑步走画面就是 3 FPS；而物理和渲染串在一起，一轮 51 ms 物理
+        加 12.5 ms 渲染，最多也只有 16 FPS，物理还被渲染拖慢。
         """
-        from PIL import Image
-
-        FRAME_DT = 1.0 / 25.0
         t_body = time.time()
-        t_frame = 0.0
         while not self._stop.is_set():
             now = time.time()
             if not self.running:
                 time.sleep(0.03)
                 t_body = now
                 continue
-            # 单次最多补 60 ms，防止卡顿之后身体瞬移
-            dt_body = min(now - t_body, 0.06)
+            # 单次最多补 20 ms。上限不能大：物理线程在这段时间里一直持着
+            # blk 锁，渲染线程要等它 —— 上限设 60 ms 时一次持锁 51 ms，实测
+            # 帧间隔最大抖到 136 ms。切成 20 ms 一块，锁最多占住 17 ms。
+            dt_body = min(now - t_body, 0.02)
             t_body = now
             try:
                 cmd = getattr(self, "cmd", None)
@@ -329,29 +332,46 @@ class Simulation:
                                      self._minfo, odor_l, odor_r, taste)
             except Exception as e:                        # noqa: BLE001
                 self.error = f"{type(e).__name__}: {e}"
+            # 让出一点时间片，别把脑线程和渲染线程饿着
+            time.sleep(0.002)
 
-            if now - t_frame >= FRAME_DT:
-                t_frame = now
-                try:
-                    with self.blk:
-                        px = self.body.render(self.camera)
-                    if self.split:
-                        from ..brainview import draw_overlay, side_by_side
-                        d = self.latest or {}
-                        px = side_by_side(px, draw_overlay(
-                            self.view.render(),
-                            "全脑活动 · MaleCNS v1.0",
-                            [f"{self.brain.n:,} 神经元 · 白点 = 此刻发放",
-                             f"全脑 {d.get('mean_rate_hz', 0)} Hz　"
-                             f"下行 {d.get('dn_hz', 0)} Hz"],
-                            self.view.labels))
-                    buf = io.BytesIO()
-                    Image.fromarray(px).save(buf, format="JPEG", quality=75)
+    def render_loop(self) -> None:
+        """渲染线程：只读身体状态出图，不碰物理。
+
+        必须和物理分开：一轮物理要 51 ms（0.4 ms 步长推进 60 ms 身体时间），
+        再加 12.5 ms 渲染就是 63 ms 一轮 —— 串在一起最多只出得了 16 FPS，
+        而且物理还被渲染拖慢。分开之后物理满速跑，渲染按自己的节拍出帧。
+        """
+        from PIL import Image
+
+        FRAME_DT = 1.0 / 30.0
+        while not self._stop.is_set():
+            t0 = time.time()
+            if not self.running:
+                time.sleep(0.05)
+                continue
+            try:
+                with self.blk:
+                    px = self.body.render(self.camera)
+                if self.split:
+                    from ..brainview import draw_overlay, side_by_side
+                    d = self.latest or {}
+                    px = side_by_side(px, draw_overlay(
+                        self.view.render(),
+                        "全脑活动 · MaleCNS v1.0",
+                        [f"{self.brain.n:,} 神经元 · 白点 = 此刻发放",
+                         f"全脑 {d.get('mean_rate_hz', 0)} Hz　"
+                         f"下行 {d.get('dn_hz', 0)} Hz"],
+                        self.view.labels))
+                buf = io.BytesIO()
+                Image.fromarray(px).save(buf, format="JPEG", quality=75)
+                with self.frame_cv:
                     self.frame = buf.getvalue()
-                except Exception:                        # noqa: BLE001
-                    pass
-            else:
-                time.sleep(0.004)
+                    self.frame_id += 1
+                    self.frame_cv.notify_all()
+            except Exception:                            # noqa: BLE001
+                pass
+            time.sleep(max(0.0, FRAME_DT - (time.time() - t0)))
 
     def _advance(self, dt_brain: float,
                  dt_body: float | None = None) -> tuple[np.ndarray, dict]:
@@ -609,6 +629,7 @@ def create_app(backend: str | None = None,
     sim = Simulation(backend=backend, behavior=behavior)
     threading.Thread(target=sim.loop, daemon=True).start()
     threading.Thread(target=sim.body_loop, daemon=True).start()
+    threading.Thread(target=sim.render_loop, daemon=True).start()
 
     @app.route("/")
     def index():
@@ -756,13 +777,19 @@ def create_app(backend: str | None = None,
     @app.route("/video")
     def video():
         def gen():
+            # 等生产端通知，每帧只发一次 —— 定时轮询会重复发和漏发，
+            # 平均帧率看着正常，观感却是一顿一顿的。
+            last = -1
             while True:
-                f = sim.frame
+                with sim.frame_cv:
+                    if not sim.frame_cv.wait_for(
+                            lambda: sim.frame_id != last, timeout=1.0):
+                        continue
+                    f, last = sim.frame, sim.frame_id
                 if f:
                     yield (b"--frame\r\nContent-Type: image/jpeg\r\n"
                            b"Content-Length: " + str(len(f)).encode() +
                            b"\r\n\r\n" + f + b"\r\n")
-                time.sleep(0.05)
         return Response(gen(), mimetype="multipart/x-mixed-replace; "
                                         "boundary=frame")
 

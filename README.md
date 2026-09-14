@@ -344,20 +344,42 @@ python cli.py web --host 0.0.0.0 --port 8080
 - Whole-brain activity map, spike raster, firing-rate time series
 - Mouse handwriting + recognition + feedback
 
-**Brain and body are two threads.** One whole-brain step costs 3.5 ms, so the brain
-only reaches 30% of real time; with the body tied to brain steps the view ran at
-3 FPS. Split apart:
+**Three threads, one job each**: the brain integrates at full speed and emits
+speed/turn commands; physics advances by real elapsed time; rendering runs at its own
+cadence.
 
 | | Before | After |
 |---|---|---|
-| Frame rate | 3 FPS | **20 FPS** |
-| Body | 0.29× real time | **0.99×** |
-| Brain | 0.14× | 0.30× |
+| Frame rate | 3 FPS | **30.2 FPS** |
+| Worst frame gap | — | 44 ms |
+| Jitter (sd) | 20 ms | **8 ms** |
+| Body | 0.29× real time | **0.95×** |
+| Brain | 0.14× | 0.32× |
+
+Three threads plus two details; miss any one and it still stutters:
+
+1. **Physics and rendering cannot share a thread.** 51 ms of physics + 12.5 ms of
+   rendering per iteration caps you at 16 FPS and slows the physics too.
+2. **MJPEG must be producer-driven.** Polling `sim.frame` every 50 ms is unsynchronised
+   with the producer — frames get duplicated and dropped. Average FPS looks fine; it
+   looks jerky.
+3. **Physics advances 20 ms at a time.** The physics thread holds the body lock for
+   that whole span and the renderer waits on it. At a 60 ms cap one hold is 51 ms and
+   the worst frame gap measured 136 ms; at 20 ms it drops to 44 ms.
 
 The cost, stated: in interactive mode brain time runs ~3× slower than body time, and
 the physics timestep is widened from 0.1 ms to 0.4 ms (measured stable — 1.31 vs 1.07
-body lengths/s; at 0.8 ms contacts fail). For strict 1:1, render offline with
-`behave`.
+body lengths/s; at 0.8 ms contacts fail). For strict 1:1, render offline with `behave`.
+
+### Deploy as a service
+
+```bash
+sudo cp deploy/digitalfly.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now digitalfly
+```
+
+Starts at boot, restarts on crash, logs to `/var/log/digitalfly.log`.
 
 ---
 
